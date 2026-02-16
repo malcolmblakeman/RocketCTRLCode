@@ -61,6 +61,7 @@ PCD_HandleTypeDef hpcd_USB_DRD_FS;
 static volatile char g_nmea[128];
 
 /* Private function prototypes -----------------------------------------------*/
+void hal_init(void);
 void systemclock_config(void);
 static void mx_gpio_init(void);
 static void mx_adc1_init(void);
@@ -218,7 +219,11 @@ static void spi1_setmode3(void)
 //////////////////////////////////////////////////
 ///* MICROCONTROLLER INITIALIZATION FUNCTIONS *///
 //////////////////////////////////////////////////
+/* Init microcontroller */
+void hal_init(void)
+{
 
+}
 
 /* Configure system clock */
 void systemclock_config(void)
