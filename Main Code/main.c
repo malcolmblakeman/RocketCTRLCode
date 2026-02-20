@@ -14,12 +14,14 @@
   * If no LICENSE file comes with this software, it is provided AS-IS.
   *
   ******************************************************************************
+**/
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "IMU.h"
-#include "BAR.h"
 #include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
 
 /* Private includes ----------------------------------------------------------*/
 
@@ -41,10 +43,22 @@
 #define FLASH_CS_GPIO 	GPIOC
 #define FLASH_CS_PIN  	GPIO_PIN_11
 
-/* Private macro -------------------------------------------------------------*/
-#define CS_LOW(port, pin)   HAL_GPIO_WritePin((port), (pin), GPIO_PIN_RESET)
-#define CS_HIGH(port, pin)  HAL_GPIO_WritePin((port), (pin), GPIO_PIN_SET)
+#define BAROM_REG_WHO_AM_I  	(0x0F)
+#define BAROM_WHO_AM_I_VAL   	(0xB3)
+#define BAROM_READ_BIT			(0x80)
 
+#define IMU_REG_WHO_AM_I    	(0x0F)
+#define IMU_WHO_AM_I_VAL  	(0x73)
+#define IMU_READ_BIT			(0x80)
+
+/* Private macro -------------------------------------------------------------*/
+#define PIN_LOW(port, pin)   		HAL_GPIO_WritePin((port), (pin), GPIO_PIN_RESET)
+#define PIN_HIGH(port, pin)  		HAL_GPIO_WritePin((port), (pin), GPIO_PIN_SET)
+
+#define FLASH_WP_ENABLE_PROTECT()	HAL_GPIO_WritePin(FLASH_WP_GPIO_Port, FLASH_WP_Pin, GPIO_PIN_RESET)
+#define FLASH_WP_DISABLE_PROTECT()	HAL_GPIO_WritePin(FLASH_WP_GPIO_Port, FLASH_WP_Pin, GPIO_PIN_SET)
+
+#define GPS_FIX_READ()  	 		(HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin) == GPIO_PIN_SET)
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
@@ -58,11 +72,14 @@ UART_HandleTypeDef huart2;
 
 PCD_HandleTypeDef hpcd_USB_DRD_FS;
 
-static volatile char g_nmea[128];
+static uint8_t  	rx_byte;
+static char     	nmea_line[128];
+static volatile 	uint16_t nmea_idx = 0;
+static volatile 	uint8_t  nmea_line_ready = 0;
 
 /* Private function prototypes -----------------------------------------------*/
-void hal_init(void);
 void systemclock_config(void);
+static void debug_swd_only_disable_jtag(void);
 static void mx_gpio_init(void);
 static void mx_adc1_init(void);
 static void mx_icache_init(void);
@@ -72,15 +89,17 @@ static void mx_usart2_uart_init(void);
 static void mx_usb_pcd_init(void);
 static void mx_tim3_init(void);
 
-inline void flash_wp_disable_protect(void);
-inline void flash_wp_enable_protect(void);
-
 void flash_read_id(uint8_t id[3]);
 
 void gps_grab_line(void);
 
-static void spi1_setmode0(void);	//Compatible with RF module and IMU
-static void spi1_setmode3(void);	//Compatible with Barometer and IMU
+static bool barom_test(uint8_t *whoami_out);
+static bool imu_test(uint8_t *who_out);
+
+int gps_readoneline(char *out, int maxlen, uint32_t timeout_ms);
+
+bool rf_read_register(uint16_t addr, uint8_t* val_out);
+static bool llcc68_wait_while_busy(uint32_t timeout_ms);
 
 
 /*-------------------------------------------------------------------------------*/
@@ -94,32 +113,104 @@ int main(void)
 {
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  hal_init();
+  HAL_Init();
 
   /* Configure the system clock */
   systemclock_config();
 
   /* Initialize all configured peripherals */
   mx_gpio_init();
-  //mx_adc1_init();
+  mx_spi1_init();
+  mx_spi2_init();				//Initialized in mode 3
+  mx_usart2_uart_init();
   //mx_icache_init();
-  // mx_spi1_init();
-  mx_spi2_init();
-  // mx_usart2_uart_init();
   //mx_usb_pcd_init();
   //mx_tim3_init();
 
-  /* Test all sensors */
-  //Flash test
-  flash_wp_disable_protect();	//Disable protect to write to flash chip
 
+  /* FLASH TEST--------------------------*/
   uint8_t id[3] = {0};
   flash_read_id(id);			//Function for reading ID for flash chip
+  __NOP();
 
-  flash_wp_enable_protect();	//Enable protect to keep flash data safe
 
-  //gps test
-  gps_grab_line();				//Get gps data
+ /* BAROMETER TEST--------------------------*/
+  uint8_t whoBarom = 0;
+  bool okBarom = barom_test(&whoBarom);
+
+  // Debug: breakpoint here
+  // Expect: who == 0xB3 and ok == true
+  __NOP();
+  (void)okBarom;
+  (void)whoBarom;
+
+
+
+  /* IMU TEST-------------------------------*/
+  uint8_t whoIMU = 0;
+  bool okIMU = imu_test(&whoIMU);
+
+  // Debug: breakpoint here
+  // Expect: who == 0x73 and ok == true
+   __NOP();
+  (void)okIMU;
+  (void)whoIMU;
+
+
+  /* GPS TEST-------------------------------*/
+  char line[128];
+  uint8_t gpsTest = 0;
+  if (gps_readoneline(line, sizeof(line), 3000))
+  {
+      // SUCCESS: put breakpoint here and inspect "line"
+	  gpsTest = 1;
+  }
+  else
+  {
+      // FAIL: no bytes/line within 3 seconds
+	  gpsTest = 0;
+  }
+  __NOP();
+
+
+  /* RF TEST--------------------------*/
+  uint8_t reg_val = 0;
+  bool ok = rf_read_register(0x08AC, &reg_val);
+  //reg_val should commonly be 0x94 or 0x96
+  __NOP();
+
+
+  /* PYRO TEST--------------------------*/
+  __NOP();
+  uint8_t cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+  PIN_HIGH(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+  cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+  PIN_LOW(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+  cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+  __NOP();
+
+  uint8_t cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
+  PIN_HIGH(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+  cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
+  PIN_LOW(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+  __NOP();
+
+  uint8_t cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
+  __NOP();
+
+  uint8_t cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
+  __NOP();
+
+  __NOP();
+  PIN_HIGH(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
+  PIN_LOW(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
+  __NOP();
+
+  cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+  cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
+  cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
+  cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
+  __NOP();
 
 
   /* START FLIGHT LOOP */
@@ -147,71 +238,134 @@ int main(void)
 ///* ALL USER DEFINED FUNCTIONS *///
 ////////////////////////////////////
 
-void flash_read_jedec_id(uint8_t id[3])
+void flash_read_id(uint8_t id[3])
 {
+	FLASH_WP_DISABLE_PROTECT();	//Disable protect to write to flash chip
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+
     uint8_t tx[4] = {0x9F, 0x00, 0x00, 0x00};
     uint8_t rx[4] = {0};
 
-    CS_LOW(FLASH_WP_GPIO_Port, FLASH_WP_Pin);
-    HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4, HAL_MAX_DELAY);
-    CS_HIGH(FLASH_WP_GPIO_Port, FLASH_WP_Pin);
+    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4, 100);
+
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
 
     id[0] = rx[1];
     id[1] = rx[2];
     id[2] = rx[3];
+
+    //FLASH_WP_ENABLE_PROTECT();	//Disable protect to write to flash chip
+    return (st == HAL_OK);
+
+}
+
+static bool barom_test(uint8_t *whoami_out)
+{
+    //Read WHO_AM_I
+    uint8_t tx[2] = { (uint8_t)(BAROM_REG_WHO_AM_I | 0x80)};
+    uint8_t rx[2] = {0};
+
+
+    PIN_LOW(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
+
+    for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+
+    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, 100);
+
+    PIN_HIGH(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
+
+    uint8_t who = rx[1];
+    uint8_t who0 = rx[0];
+
+    if (whoami_out) *whoami_out = who;
+
+    return (st == HAL_OK) && (who == BAROM_WHO_AM_I_VAL);
 }
 
 
-inline void flash_wp_disable_protect(void)
+static bool imu_test(uint8_t *who_out)
 {
-    // WP# is active-low, so drive HIGH to disable write-protect
-    HAL_GPIO_WritePin(FLASH_WP_GPIO_Port, FLASH_WP_Pin, GPIO_PIN_SET);
+  // ---- Read WHO_AM_I (single transaction) ----
+  uint8_t tx[2] = { (uint8_t)(IMU_REG_WHO_AM_I | 0x80)};
+  uint8_t rx[2] = { 0 };
+
+  PIN_LOW(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
+  for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+
+
+  HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, 100);
+
+  PIN_HIGH(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
+
+  uint8_t who = rx[1];
+  if (who_out) *who_out = who;
+
+  return (st == HAL_OK) && (who == IMU_WHO_AM_I_VAL);
 }
 
-inline void flash_wp_enable_protect(void)
-{
-    // Drive LOW to enable write-protect (only if you intentionally want it)
-    HAL_GPIO_WritePin(FLASH_WP_GPIO_Port, FLASH_WP_Pin, GPIO_PIN_RESET);
-}
 
-void gps_grab_line(void)
+int gps_readoneline(char *out, int maxlen, uint32_t timeout_ms)
 {
-    uint8_t ch;
-    uint32_t idx = 0;
+    uint8_t nmeaEnd;
+    int idx = 0;
+    uint32_t tick = HAL_GetTick();
 
-    while (1)
+    while ((HAL_GetTick() - tick) < timeout_ms)
     {
-        if (HAL_UART_Receive(&huart2, &ch, 1, 500) == HAL_OK)
+        if (HAL_UART_Receive(&huart2, &nmeaEnd, 1, 10) == HAL_OK)
         {
-            if (idx < sizeof(g_nmea)-1)
-            	g_nmea[idx++] = (char)ch;
+            if (idx < (maxlen - 1))
+                out[idx++] = (char)nmeaEnd;
 
-            if (ch == '\n')
+            if (nmeaEnd == '\n')   // end of NMEA sentence
             {
-            	g_nmea[idx] = 0;
-                __BKPT(0);   // inspect g_nmea[] in debugger
-                idx = 0;
+                out[idx] = '\0';
+                return 1;    // got a line
             }
         }
     }
+    uint8_t gpsFix = HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin);
+    if (maxlen > 0) out[0] = '\0';
+    return 0; // timed out
 }
 
-static void spi1_setmode0(void)
+
+bool rf_read_register(uint16_t addr, uint8_t* val_out)
 {
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase    = SPI_PHASE_1EDGE;
-  HAL_SPI_DeInit(&hspi1);
-  HAL_SPI_Init(&hspi1);
+    llcc68_wait_while_busy(100);
+
+    uint8_t tx[5] = {
+        0x1D,                  // ReadRegister
+        (uint8_t)(addr >> 8),  // addr MSB
+        (uint8_t)(addr & 0xFF),// addr LSB
+        0x00,                  // dummy
+        0x00                   // clock 1 byte out
+    };
+    uint8_t rx[5] = {0};
+
+    PIN_LOW(SPI1_CS_RF_GPIO_Port, SPI1_CS_RF_Pin);
+    for (volatile int i = 0; i < 200; i++) __NOP();
+
+    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, sizeof(tx), 100);
+
+    PIN_HIGH(SPI1_CS_RF_GPIO_Port, SPI1_CS_RF_Pin);
+
+    llcc68_wait_while_busy(100);
+
+    if (val_out) *val_out = rx[4];
+    return (st == HAL_OK);
 }
 
-static void spi1_setmode3(void)
+static bool llcc68_wait_while_busy(uint32_t timeout_ms)
 {
-  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
-  hspi1.Init.CLKPhase    = SPI_PHASE_2EDGE;
-  HAL_SPI_DeInit(&hspi1);
-  HAL_SPI_Init(&hspi1);
+  uint32_t t0 = HAL_GetTick();
+  while (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_0) == GPIO_PIN_SET) // PH0 BUSY
+  {
+    if ((HAL_GetTick() - t0) >= timeout_ms) return false;
+  }
+  return true;
 }
-
 
 /*-------------------------------------------------------------------------------*/
 
@@ -219,11 +373,6 @@ static void spi1_setmode3(void)
 //////////////////////////////////////////////////
 ///* MICROCONTROLLER INITIALIZATION FUNCTIONS *///
 //////////////////////////////////////////////////
-/* Init microcontroller */
-void hal_init(void)
-{
-
-}
 
 /* Configure system clock */
 void systemclock_config(void)
@@ -232,7 +381,7 @@ void systemclock_config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /* Configure the main internal regulator output voltage */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
@@ -243,14 +392,14 @@ void systemclock_config(void)
   RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV2;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
-  RCC_OscInitStruct.CSIState = RCC_CSI_ON;
+  RCC_OscInitStruct.CSIState = RCC_CSI_OFF;
   RCC_OscInitStruct.CSICalibrationValue = RCC_CSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLL1_SOURCE_CSI;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLL1_SOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 32;
+  RCC_OscInitStruct.PLL.PLLN = 10;
   RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 3;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
   RCC_OscInitStruct.PLL.PLLR = 2;
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1_VCIRANGE_2;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1_VCORANGE_WIDE;
@@ -280,47 +429,6 @@ void systemclock_config(void)
 }
 
 
-/* Configure ADC 1 for pyro continuity testing (Probably not needed) */
-static void mx_adc1_init(void)
-{
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-  /* Common config */
-  hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
-  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-  hadc1.Init.LowPowerAutoWait = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.SamplingMode = ADC_SAMPLING_MODE_NORMAL;
-  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  hadc1.Init.OversamplingMode = DISABLE;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /* Configure Regular Channel */
-  sConfig.Channel = ADC_CHANNEL_3;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
-  sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.OffsetNumber = ADC_OFFSET_NONE;
-  sConfig.Offset = 0;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-
 /* Configure icache for debug efficiency */
 void mx_icache_init(void)
 {
@@ -340,8 +448,8 @@ static void mx_spi1_init(void)
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
-  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
   hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
@@ -373,8 +481,8 @@ static void mx_spi2_init(void)
   hspi2.Init.Mode = SPI_MODE_MASTER;
   hspi2.Init.Direction = SPI_DIRECTION_2LINES;
   hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi2.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
   hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
@@ -519,11 +627,8 @@ static void mx_gpio_init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, IMU_INT_1_Pin|IMU_INT_2_Pin|LoRa_INT_1_Pin|SPI1_CS_RF_Pin
-                          |SPI2_CS_Flash_Pin|SPI1_CS_BAROM_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(Busy_GPIO_Port, Busy_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, IMU_INT_1_Pin|IMU_INT_2_Pin|LoRa_INT_1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, SPI1_CS_RF_Pin|SPI2_CS_Flash_Pin|SPI1_CS_BAROM_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, RSFW_V2_Pin|Pyro_CTRL_Master_Pin, GPIO_PIN_RESET);
@@ -532,20 +637,18 @@ static void mx_gpio_init(void)
   HAL_GPIO_WritePin(GPIOB, LED4_Pin|LED3_Pin|LED2_Pin|LED1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin, GPIO_PIN_SET);
 
-  /*Configure GPIO pins : IMU_INT_1_Pin IMU_INT_2_Pin LoRa_INT_1_Pin SPI1_CS_RF_Pin
-                           SPI2_CS_Flash_Pin SPI1_CS_BAROM_Pin */
-  GPIO_InitStruct.Pin = IMU_INT_1_Pin|IMU_INT_2_Pin|LoRa_INT_1_Pin|SPI1_CS_RF_Pin
-                          |SPI2_CS_Flash_Pin|SPI1_CS_BAROM_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  /*Configure GPIO pins : IMU_INT_1_Pin IMU_INT_2_Pin LoRa_INT_1_Pin */
+  GPIO_InitStruct.Pin = IMU_INT_1_Pin|IMU_INT_2_Pin|LoRa_INT_1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : Busy_Pin */
   GPIO_InitStruct.Pin = Busy_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(Busy_GPIO_Port, &GPIO_InitStruct);
@@ -557,7 +660,7 @@ static void mx_gpio_init(void)
   HAL_GPIO_Init(BAROM_INT_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : RSFW_V2_Pin Pyro_CTRL_Master_Pin */
-  GPIO_InitStruct.Pin = RSFW_V2_Pin|Pyro_CTRL_Master_Pin;
+  GPIO_InitStruct.Pin = RSFW_V2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -585,7 +688,7 @@ static void mx_gpio_init(void)
   /*Configure GPIO pin : FLASH_WP_Pin */
   GPIO_InitStruct.Pin = FLASH_WP_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(FLASH_WP_GPIO_Port, &GPIO_InitStruct);
 
@@ -596,11 +699,51 @@ static void mx_gpio_init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(SPI1_CS_IMU_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : SPI1_CS_RF_Pin|SPI2_CS_Flash_Pin|SPI1_CS_BAROM_Pin*/
+  GPIO_InitStruct.Pin = SPI1_CS_RF_Pin|SPI2_CS_Flash_Pin|SPI1_CS_BAROM_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /*Configure GPIO pin : Float_Pin */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Pyro_CTRL_Master_Pin */
+  GPIO_InitStruct.Pin = Pyro_CTRL_Master_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Pyro_CONT_1_Pin, Pyro_CONT_2_Pin, Pyro_CONT_3_Pin, Pyro_CONT_4_Pin */
+  GPIO_InitStruct.Pin = Pyro_CONT_1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Pyro_CONT_1_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = Pyro_CONT_2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Pyro_CONT_2_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = Pyro_CONT_3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Pyro_CONT_3_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = Pyro_CONT_4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Pyro_CONT_4_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Pyro_CTRL_1_Pin, Pyro_CTRL_2_Pin, Pyro_CTRL_3_Pin, Pyro_CTRL_4_Pin */
+  GPIO_InitStruct.Pin = Pyro_CTRL_1_Pin|Pyro_CTRL_2_Pin|Pyro_CTRL_3_Pin|Pyro_CTRL_4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
 }
 
 
