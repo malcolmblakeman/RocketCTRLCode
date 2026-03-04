@@ -24,10 +24,12 @@
 #include <stdbool.h>
 
 /* Private includes ----------------------------------------------------------*/
+#include "lps22hh_reg.h"
+#include "lps22hh.h"
+#include "lsm6dsv80x_reg.h"
 
 /* Private typedef -----------------------------------------------------------*/
 
-/* Private define ------------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 #define LED1_GPIO_Port 	GPIOB
 #define LED1_Pin       	GPIO_PIN_15
@@ -49,7 +51,7 @@
 #define BAROM_READ_BIT			(0x80)
 
 #define IMU_REG_WHO_AM_I    	(0x0F)
-#define IMU_WHO_AM_I_VAL  	(0x73)
+#define IMU_WHO_AM_I_VAL  		(0x73)
 #define IMU_READ_BIT			(0x80)
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,16 +75,25 @@ UART_HandleTypeDef huart2;
 
 PCD_HandleTypeDef hpcd_USB_DRD_FS;
 
+//Test Variables
 static uint8_t  	rx_byte;
 static char     	nmea_line[128];
 static volatile 	uint16_t nmea_idx = 0;
 static volatile 	uint8_t  nmea_line_ready = 0;
 
+//Real Program Variables
+static volatile 	uint8_t g_pyroActive = 0;
+static volatile 	uint8_t g_pyroTicks = 0;   		//Determines how long pyro channels on
+static volatile 	uint8_t g_rfTicks = 0;			//Determines how long between every rf tx
+static volatile 	uint32_t g_timeStamp = 0;		//Keeps track of time in 100's of ms
+static volatile 	uint8_t g_rfTx = 0;				//Transmit to LoRa module
+static volatile 	uint8_t g_getData = 1;
+
+
 /* Private function prototypes -----------------------------------------------*/
+//Initialization Functions
 void systemclock_config(void);
-static void debug_swd_only_disable_jtag(void);
 static void mx_gpio_init(void);
-static void mx_adc1_init(void);
 static void mx_icache_init(void);
 static void mx_spi1_init(void);
 static void mx_spi2_init(void);
@@ -90,17 +101,21 @@ static void mx_usart2_uart_init(void);
 static void mx_usb_pcd_init(void);
 static void mx_tim3_init(void);
 
+//Sensor test functions
+void test_all(void);
+
+void pyro_test(void);
 void flash_read_id(uint8_t id[3]);
-
 void gps_grab_line(void);
-
 static bool barom_test(uint8_t *whoami_out);
 static bool imu_test(uint8_t *who_out);
-
 int gps_readoneline(char *out, int maxlen, uint32_t timeout_ms);
-
 bool rf_read_register(uint16_t addr, uint8_t* val_out);
 static bool llcc68_wait_while_busy(uint32_t timeout_ms);
+
+//User defined functions
+static void light_apogee_pyro(void);
+static void light_main_pyro(void);
 
 
 /*-------------------------------------------------------------------------------*/
@@ -119,115 +134,91 @@ int main(void)
   /* Configure the system clock */
   systemclock_config();
 
+  //Test clock frequencies
+  volatile uint32_t sys_hz  = HAL_RCC_GetSysClockFreq();
+  volatile uint32_t hclk_hz = HAL_RCC_GetHCLKFreq();
+  volatile uint32_t p1_hz   = HAL_RCC_GetPCLK1Freq();
+  volatile uint32_t p2_hz   = HAL_RCC_GetPCLK2Freq();
+  volatile uint32_t p3_hz   = HAL_RCC_GetPCLK3Freq();
+
   /* Initialize all configured peripherals */
   mx_gpio_init();
+  HAL_GPIO_WritePin(GPIOC, Pyro_CTRL_1_Pin | Pyro_CTRL_2_Pin | Pyro_CTRL_3_Pin | Pyro_CTRL_4_Pin, GPIO_PIN_RESET);	//Ensure low for pyro safety
+
   mx_spi1_init();
-  mx_spi2_init();				//Initialized in mode 3
+  mx_spi2_init();					//Initialized in mode 3
   mx_usart2_uart_init();
-  //mx_icache_init();
   //mx_usb_pcd_init();
-  //mx_tim3_init();
-
-
-  /* FLASH TEST--------------------------*/
-  uint8_t id[3] = {0};
-  flash_read_id(id);			//Function for reading ID for flash chip
-  __NOP();
-
-
- /* BAROMETER TEST--------------------------*/
-  uint8_t whoBarom = 0;
-  bool okBarom = barom_test(&whoBarom);
-
-  // Debug: breakpoint here
-  // Expect: who == 0xB3 and ok == true
-  __NOP();
-  (void)okBarom;
-  (void)whoBarom;
+  mx_tim3_init();
+  //mx_icache_init();
 
 
 
-  /* IMU TEST-------------------------------*/
-  uint8_t whoIMU = 0;
-  bool okIMU = imu_test(&whoIMU);
+  /* Initialize variables, test, and start timer */
+  uint8_t flashTx = 0;				//Transmit to flash chip
+  uint8_t tx_buf[32];				//Save data to buffer to transmit
 
-  // Debug: breakpoint here
-  // Expect: who == 0x73 and ok == true
-   __NOP();
-  (void)okIMU;
-  (void)whoIMU;
-
-
-  /* GPS TEST-------------------------------*/
-  char line[128];
-  uint8_t gpsTest = 0;
-  if (gps_readoneline(line, sizeof(line), 3000))
-  {
-      // SUCCESS: put breakpoint here and inspect "line"
-	  gpsTest = 1;
-  }
-  else
-  {
-      // FAIL: no bytes/line within 3 seconds
-	  gpsTest = 0;
-  }
-  __NOP();
+  //All data values for tx_buf
+  //TODO: Change number of bytes depending on data. 16bit for lon and lat?
+  uint8_t alt = 0;
+  uint8_t highG = 0;
+  uint8_t lowG = 0;
+  uint8_t xGyro = 0;
+  uint8_t yGyro = 0;
+  uint8_t zGyro = 0;
+  uint8_t lon = 0;
+  uint8_t lat = 0;
 
 
-  /* RF TEST--------------------------*/
-  uint8_t reg_val = 0;
-  bool ok = rf_read_register(0x08AC, &reg_val);
-  //reg_val should commonly be 0x94 or 0x96
-  __NOP();
 
 
-  /* PYRO TEST--------------------------*/
-  __NOP();
-  uint8_t cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-  PIN_HIGH(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
-  cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-  PIN_LOW(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
-  cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-  __NOP();
-
-  uint8_t cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
-  PIN_HIGH(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
-  cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
-  PIN_LOW(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
-  __NOP();
-
-  uint8_t cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
-  __NOP();
-
-  uint8_t cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
-  __NOP();
-
-  __NOP();
-  PIN_HIGH(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
-  PIN_LOW(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
-  __NOP();
-
-  cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-  cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
-  cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
-  cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
-  __NOP();
-
+  //test_all();						//Test sensors
+  HAL_TIM_Base_Start_IT(&htim3);	//start timer interrupt
 
   /* START FLIGHT LOOP */
   while (1)
   {
-	  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
-	  HAL_Delay(150);
+	  if (g_getData)
+	  {
+		  //TODO: add functions for communicating with sensors and saving the obtained data
+		  //Read Barom
+		  //Read IMU
+		  //Read GPS
+		  //Add all data to tx_buf
+		  flashTx = 1;
+		  g_getData = 0;
+	  }
 
-	  HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
-	  HAL_Delay(150);
+	  //TODO: Come up with formula for calculating when to ignite parachutes
+	  /* if(Altitude and acceleration == ?)
+	   * {
+	   * light_apogee_pyro();
+	   * }
+	   */
 
-	  HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
-	  HAL_Delay(150);
+	  //Should this be a timing thing? After apogee parachute is lit, wait 10s then ignite main?
+	  /* if(Altitude and acceleration == ? && g_pyroActive == 0)
+	   * {
+	   * light_main_pyro();
+	   * }
+	   */
 
-	  HAL_GPIO_TogglePin(LED4_GPIO_Port, LED4_Pin);
-	  HAL_Delay(150);
+	  if (flashTx)
+	  {
+		  if(g_rfTx)
+		  {
+			  //TODO: Function for transmitting data over LoRa
+			  //Transmit latest data packet over LoRa
+			  g_rfTx = 0;
+		  }
+
+		  //TODO: Function for transmitting data to flash
+		  //Transmit latest data packet to flash chip
+
+		  memset(tx_buf, 0, sizeof(tx_buf));		//Clear data buffer
+		  flashTx = 0;
+	  }
+
   }
 }
 
@@ -239,138 +230,59 @@ int main(void)
 ///* ALL USER DEFINED FUNCTIONS *///
 ////////////////////////////////////
 
-void flash_read_id(uint8_t id[3])
+static void light_apogee_pyro(void)
 {
-	FLASH_WP_DISABLE_PROTECT();	//Disable protect to write to flash chip
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+  // Set PC6-9 HIGH
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_SET);
 
-    uint8_t tx[4] = {0x9F, 0x00, 0x00, 0x00};
-    uint8_t rx[4] = {0};
-
-    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4, 100);
-
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-
-    id[0] = rx[1];
-    id[1] = rx[2];
-    id[2] = rx[3];
-
-    //FLASH_WP_ENABLE_PROTECT();	//Disable protect to write to flash chip
-    return (st == HAL_OK);
-
+  g_pyroActive = 1;
+  g_pyroTicks = 0;
 }
 
-static bool barom_test(uint8_t *whoami_out)
+static void light_main_pyro(void)
 {
-    //Read WHO_AM_I
-    uint8_t tx[2] = { (uint8_t)(BAROM_REG_WHO_AM_I | 0x80)};
-    uint8_t rx[2] = {0};
+  // Set PC6-9 HIGH
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
 
-
-    PIN_LOW(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-
-    for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
-
-    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, 100);
-
-    PIN_HIGH(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-
-    uint8_t who = rx[1];
-    uint8_t who0 = rx[0];
-
-    if (whoami_out) *whoami_out = who;
-
-    return (st == HAL_OK) && (who == BAROM_WHO_AM_I_VAL);
+  g_pyroActive = 1;
+  g_pyroTicks = 0;
 }
 
+/*-------------------------------------------------------------------------------*/
 
-static bool imu_test(uint8_t *who_out)
+
+////////////////////////////
+///* Interrupt Handlers *///
+////////////////////////////
+
+/* 100ms Delay Logic */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  // ---- Read WHO_AM_I (single transaction) ----
-  uint8_t tx[2] = { (uint8_t)(IMU_REG_WHO_AM_I | 0x80)};
-  uint8_t rx[2] = { 0 };
+	g_timeStamp++;		//Keeps track of time in 100's of ms
+	g_getData = 1;
 
-  PIN_LOW(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-  for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+	/* Pyro channel control logic */
+	if (g_pyroActive)
+	{
+		g_pyroTicks++;
 
+		if (g_pyroTicks >= 10) // 10 * 100ms = 1.0s
+		{
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_RESET);
+			g_pyroActive = 0;
+		}
+	}
 
-  HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, 100);
-
-  PIN_HIGH(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-
-  uint8_t who = rx[1];
-  if (who_out) *who_out = who;
-
-  return (st == HAL_OK) && (who == IMU_WHO_AM_I_VAL);
-}
-
-
-int gps_readoneline(char *out, int maxlen, uint32_t timeout_ms)
-{
-    uint8_t nmeaEnd;
-    int idx = 0;
-    uint32_t tick = HAL_GetTick();
-
-    while ((HAL_GetTick() - tick) < timeout_ms)
-    {
-        if (HAL_UART_Receive(&huart2, &nmeaEnd, 1, 10) == HAL_OK)
-        {
-            if (idx < (maxlen - 1))
-                out[idx++] = (char)nmeaEnd;
-
-            if (nmeaEnd == '\n')   // end of NMEA sentence
-            {
-                out[idx] = '\0';
-                return 1;    // got a line
-            }
-        }
-    }
-    uint8_t gpsFix = HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin);
-    if (maxlen > 0) out[0] = '\0';
-    return 0; // timed out
-}
-
-
-bool rf_read_register(uint16_t addr, uint8_t* val_out)
-{
-    llcc68_wait_while_busy(100);
-
-    uint8_t tx[5] = {
-        0x1D,                  // ReadRegister
-        (uint8_t)(addr >> 8),  // addr MSB
-        (uint8_t)(addr & 0xFF),// addr LSB
-        0x00,                  // dummy
-        0x00                   // clock 1 byte out
-    };
-    uint8_t rx[5] = {0};
-
-    PIN_LOW(SPI1_CS_RF_GPIO_Port, SPI1_CS_RF_Pin);
-    for (volatile int i = 0; i < 200; i++) __NOP();
-
-    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, sizeof(tx), 100);
-
-    PIN_HIGH(SPI1_CS_RF_GPIO_Port, SPI1_CS_RF_Pin);
-
-    llcc68_wait_while_busy(100);
-
-    if (val_out) *val_out = rx[4];
-    return (st == HAL_OK);
-}
-
-static bool llcc68_wait_while_busy(uint32_t timeout_ms)
-{
-  uint32_t t0 = HAL_GetTick();
-  while (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_0) == GPIO_PIN_SET) // PH0 BUSY
-  {
-    if ((HAL_GetTick() - t0) >= timeout_ms) return false;
-  }
-  return true;
+	/* RF transmission logic */
+	g_rfTicks++;
+	if (g_rfTicks >= 10){
+		g_rfTx = 1;
+		g_rfTicks = 0;
+	}
 }
 
 
 /*-------------------------------------------------------------------------------*/
-
 
 //////////////////////////////////////////////////
 ///* MICROCONTROLLER INITIALIZATION FUNCTIONS *///
@@ -511,56 +423,24 @@ static void mx_spi2_init(void)
 /* Configure Timer for Interrupts to Transmit and Save Data */
 static void mx_tim3_init(void)
 {
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
+	TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+	TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 65535;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  HAL_TIM_MspPostInit(&htim3);
+	htim3.Instance = TIM3;
+	htim3.Init.Prescaler = 31999;                 // 32MHz/32000 = 1kHz (1ms tick)
+	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim3.Init.Period = 99;                       // 100ms
+	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+	if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
+
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK) Error_Handler();
+
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) Error_Handler();
 }
 
 
@@ -748,6 +628,268 @@ static void mx_gpio_init(void)
 
 }
 
+
+/*-------------------------------------------------------------------------------*/
+
+///////////////////////////////////
+///* ALL SENSOR TEST FUNCTIONS *///
+///////////////////////////////////
+
+void test_all(void){
+
+	  /* FLASH TEST--------------------------*/
+	  uint8_t id[3] = {0};
+	  flash_read_id(id);			//Function for reading ID for flash chip
+	  __NOP();
+
+
+	 /* BAROMETER TEST--------------------------*/
+	  uint8_t whoBarom = 0;
+	  bool okBarom = barom_test(&whoBarom);
+
+	  // Debug: breakpoint here
+	  // Expect: who == 0xB3 and ok == true
+	  __NOP();
+	  (void)okBarom;
+	  (void)whoBarom;
+
+
+
+	  /* IMU TEST-------------------------------*/
+	  uint8_t whoIMU = 0;
+	  bool okIMU = imu_test(&whoIMU);
+
+	  // Debug: breakpoint here
+	  // Expect: who == 0x73 and ok == true
+	   __NOP();
+	  (void)okIMU;
+	  (void)whoIMU;
+
+
+
+	  const char *cmd = "$PMTK104*37\r\n";
+	  HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 100);
+
+
+	  /* GPS TEST-------------------------------*/
+	  while(1){
+		  char line[128];
+		  uint8_t gpsTest;
+
+		  if (gps_readoneline(line, sizeof(line), 3000))
+		  {
+		      gpsTest = 1;      // line contains a clean "$G....\r\n"
+		      // breakpoint: inspect line
+		  }
+		  else
+		  {
+		      gpsTest = 0;
+		  }
+
+		  if (HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin) == 1)
+		  {
+			  HAL_GPIO_WritePin((LED1_GPIO_Port), (LED1_Pin), GPIO_PIN_SET);
+		  }
+
+	 	  __NOP();
+	  }
+
+
+
+	  /* RF TEST--------------------------*/
+	  uint8_t reg_val = 0;
+	  bool ok = rf_read_register(0x08AC, &reg_val);
+	  //reg_val should commonly be 0x94 or 0x96
+	  __NOP();
+
+
+	  /* PYRO TEST--------------------------*/
+	  __NOP();
+	  pyro_test();
+	  __NOP();
+}
+
+void pyro_test(void){
+
+	uint8_t cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+	PIN_HIGH(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+	cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+	PIN_LOW(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+	cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+	__NOP();
+
+	uint8_t cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
+	PIN_HIGH(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+	cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
+	PIN_LOW(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+	__NOP();
+
+	uint8_t cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
+	__NOP();
+
+	uint8_t cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
+	__NOP();
+
+	__NOP();
+	PIN_HIGH(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
+	PIN_LOW(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
+	__NOP();
+
+	cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
+	cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
+	cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
+	cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
+	__NOP();
+
+	return;
+}
+
+void flash_read_id(uint8_t id[3])
+{
+	FLASH_WP_DISABLE_PROTECT();	//Disable protect to write to flash chip
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+
+    uint8_t tx[4] = {0x9F, 0x00, 0x00, 0x00};
+    uint8_t rx[4] = {0};
+
+    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4, 100);
+
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    id[0] = rx[1];
+    id[1] = rx[2];
+    id[2] = rx[3];
+
+    //FLASH_WP_ENABLE_PROTECT();	//Disable protect to write to flash chip
+    return (st == HAL_OK);
+
+}
+
+static bool barom_test(uint8_t *whoami_out)
+{
+    //Read WHO_AM_I
+    uint8_t tx[2] = { (uint8_t)(BAROM_REG_WHO_AM_I | 0x80)};
+    uint8_t rx[2] = {0};
+
+
+    PIN_LOW(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
+
+    for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+
+    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, 100);
+
+    PIN_HIGH(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
+
+    uint8_t who = rx[1];
+    uint8_t who0 = rx[0];
+
+    if (whoami_out) *whoami_out = who;
+
+    return (st == HAL_OK) && (who == BAROM_WHO_AM_I_VAL);
+}
+
+
+static bool imu_test(uint8_t *who_out)
+{
+  // ---- Read WHO_AM_I (single transaction) ----
+  uint8_t tx[2] = { (uint8_t)(IMU_REG_WHO_AM_I | 0x80)};
+  uint8_t rx[2] = { 0 };
+
+  PIN_LOW(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
+  for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
+
+
+  HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, 100);
+
+  PIN_HIGH(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
+
+  uint8_t who = rx[1];
+  if (who_out) *who_out = who;
+
+  return (st == HAL_OK) && (who == IMU_WHO_AM_I_VAL);
+}
+
+
+int gps_readoneline(char *out, int maxlen, uint32_t timeout_ms)
+{
+    uint8_t c;
+    int idx = 0;
+    uint32_t t0 = HAL_GetTick();
+
+    if (maxlen <= 0) return 0;
+    memset(out, 0, maxlen);
+
+    while ((HAL_GetTick() - t0) < timeout_ms)
+    {
+        if (HAL_UART_Receive(&huart2, &c, 1, 10) == HAL_OK)
+        {
+            if (c == '$')
+            {
+                // hard resync: start a new sentence right here
+                idx = 0;
+                out[idx++] = '$';
+                continue;
+            }
+
+            // ignore everything until we've seen a '$'
+            if (idx == 0) continue;
+
+            if (idx < (maxlen - 1))
+                out[idx++] = (char)c;
+            else
+                idx = 0; // overflow -> resync
+
+            if (c == '\n')
+            {
+                out[idx] = '\0';
+                return 1;
+            }
+        }
+    }
+    out[0] = '\0';
+    return 0;
+}
+
+
+bool rf_read_register(uint16_t addr, uint8_t* val_out)
+{
+    llcc68_wait_while_busy(100);
+
+    uint8_t tx[5] = {
+        0x1D,                  // ReadRegister
+        (uint8_t)(addr >> 8),  // addr MSB
+        (uint8_t)(addr & 0xFF),// addr LSB
+        0x00,                  // dummy
+        0x00                   // clock 1 byte out
+    };
+    uint8_t rx[5] = {0};
+
+    PIN_LOW(SPI1_CS_RF_GPIO_Port, SPI1_CS_RF_Pin);
+    for (volatile int i = 0; i < 200; i++) __NOP();
+
+    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, sizeof(tx), 100);
+
+    PIN_HIGH(SPI1_CS_RF_GPIO_Port, SPI1_CS_RF_Pin);
+
+    llcc68_wait_while_busy(100);
+
+    if (val_out) *val_out = rx[4];
+    return (st == HAL_OK);
+}
+
+static bool llcc68_wait_while_busy(uint32_t timeout_ms)
+{
+  uint32_t t0 = HAL_GetTick();
+  while (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_0) == GPIO_PIN_SET) // PH0 BUSY
+  {
+    if ((HAL_GetTick() - t0) >= timeout_ms) return false;
+  }
+  return true;
+}
+
+
+/*-------------------------------------------------------------------------------*/
 
 
 void Error_Handler(void)
