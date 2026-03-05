@@ -88,6 +88,7 @@ static volatile 	uint8_t g_rfTicks = 0;			//Determines how long between every rf
 static volatile 	uint32_t g_timeStamp = 0;		//Keeps track of time in 100's of ms
 static volatile 	uint8_t g_rfTx = 0;				//Transmit to LoRa module
 static volatile 	uint8_t g_getData = 1;
+static volatile     uint32_t flash_write_addr = 0;
 
 
 /* Private function prototypes -----------------------------------------------*/
@@ -185,6 +186,7 @@ int main(void)
 		  //Read IMU
 		  //Read GPS
 		  //Add all data to tx_buf
+		  //read flash chip
 		  flashTx = 1;
 		  g_getData = 0;
 	  }
@@ -214,7 +216,11 @@ int main(void)
 
 		  //TODO: Function for transmitting data to flash
 		  //Transmit latest data packet to flash chip
-
+		if (flash_write_addr < 0xFFFFFF)
+		{
+			flash_page_program(flash_write_addr, tx_buf, sizeof(tx_buf));
+			flash_write_addr += sizeof(tx_buf);
+		}
 		  memset(tx_buf, 0, sizeof(tx_buf));		//Clear data buffer
 		  flashTx = 0;
 	  }
@@ -888,7 +894,50 @@ static bool llcc68_wait_while_busy(uint32_t timeout_ms)
   return true;
 }
 
+static void flash_write_enable(void)
+{
+    uint8_t cmd = 0x06;
 
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+}
+
+static uint8_t flash_read_status(void)
+{
+    uint8_t tx[2] = {0x05,0x00};
+    uint8_t rx[2] = {0};
+
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    HAL_SPI_TransmitReceive(&hspi2, tx, rx, 2, 100);
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    return rx[1];
+}
+
+void flash_page_program(uint32_t addr, uint8_t *data, uint16_t len)
+{
+    uint8_t cmd[4];
+
+    flash_write_enable();
+
+    cmd[0] = 0x02;                     // Page program
+    cmd[1] = (addr >> 16) & 0xFF;
+    cmd[2] = (addr >> 8) & 0xFF;
+    cmd[3] = addr & 0xFF;
+
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
+    HAL_SPI_Transmit(&hspi2, data, len, 100);
+
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    while(flash_read_status() & 0x01)
+    {
+        __NOP();
+    }
+}
 /*-------------------------------------------------------------------------------*/
 
 
