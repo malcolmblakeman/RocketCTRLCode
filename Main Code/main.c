@@ -257,6 +257,11 @@ int main(void)
 	  }
 
   }
+
+	//after main loop, read first flight packet
+	uint8_t packet[32];
+
+	flash_read(0x000000, packet, 32);
 }
 
 
@@ -521,6 +526,23 @@ static uint8_t flash_read_status(void)
     PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
 
     return rx[1];
+}
+
+void flash_read(uint32_t addr, uint8_t *data, uint16_t len)
+{
+    uint8_t cmd[4];
+
+    cmd[0] = 0x03;                     // READ command
+    cmd[1] = (addr >> 16) & 0xFF;
+    cmd[2] = (addr >> 8) & 0xFF;
+    cmd[3] = addr & 0xFF;
+
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
+    HAL_SPI_Receive(&hspi2, data, len, 100);
+
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
 }
 
 /*------------------ GPS functions -----------------*/
