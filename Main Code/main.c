@@ -516,6 +516,15 @@ void flash_write_enable(void)
     PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
 }
 
+void flash_write_disable(void)
+{
+    uint8_t cmd = 0x04;
+
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+}
+
 static uint8_t flash_read_status(void)
 {
     uint8_t tx[2] = {0x05,0x00};
