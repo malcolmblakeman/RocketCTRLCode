@@ -115,6 +115,10 @@ static inline void pack_buf(uint8_t tx_buf[32],
                           uint16_t pres,
                           uint16_t temp);
 static uint8_t flash_read_status(void);
+static void flash_wait_busy(void);
+void flash_read(uint32_t addr, uint8_t *data, uint16_t len);
+void flash_init(void);
+void flash_sector_erase(uint32_t addr);
 
 /*-------------------------------------------------------------------------------*/
 
@@ -151,8 +155,14 @@ int main(void)
 
   /* Initialize variables, test, and start timer */
   uint8_t dataReady = 0;				//Transmit to flash chip
-  uint8_t tx_buf[32];				//Save data to buffer to transmit
-
+    uint8_t tx_buf[32] = {
+      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+      0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0, 0x0F,
+      0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89,
+      0x9A, 0xAB, 0xBC, 0xCD, 0xDE, 0xEF, 0x5A, 0xA5
+  };				//Save data to buffer to transmit. Random values for test
+  uint8_t rx_buf[32] = {0};
+	
   uint16_t pres_u16 = 0;
   uint16_t temp_u16 = 0;
 
@@ -230,7 +240,7 @@ int main(void)
 		  dataReady = 1;		//add error checking to set data ready to 0 in case of incorrect/corrupted data
 		  g_getData = 0;
 	  }
-
+		
 	  if (dataReady)
 	  {
 		  //Create buffer to be sent
@@ -255,13 +265,9 @@ int main(void)
 
 		  dataReady = 0;
 	  }
-
+	  flash_read(0x000000, rx_buf, 32);
+	  __NOP();
   }
-
-	//after main loop, read first flight packet
-	uint8_t packet[32];
-
-	flash_read(0x000000, packet, 32);
 }
 
 
@@ -485,73 +491,127 @@ int imu_read(int16_t lowG[3], int16_t highG[3], int16_t gyro[3])
 }
 /*------------------ Flash functions -----------------*/
 
-void flash_page_program(uint32_t addr, uint8_t *data, uint16_t len)
+void flash_init(void)
 {
-    while(flash_read_status() & 0x01)
-    {
-        __NOP();
-    }
+    uint8_t cmd;
+    uint8_t jedec[3] = {0};
 
+    // Disable hardware write protection
+    FLASH_WP_DISABLE_PROTECT();
+
+    __NOP();
+
+    flash_write_enable();
+
+    flash_wait_busy();
+
+    // Global Block Protection Unlock
+    cmd = 0x98;   //Global Block Protection Unlock Command
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    // Wait until device is no longer busy
+    flash_wait_busy();
+
+    //sanity check: read JEDEC ID
+    cmd = 0x9F;   // JEDEC ID Read Command
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    HAL_SPI_Receive(&hspi2, jedec, 3, 100);
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    __NOP();		//Check ID Here
+}
+
+void flash_sector_erase(uint32_t addr)
+{
     uint8_t cmd[4];
 
-    cmd[0] = 0x02;                     // Page program
+    cmd[0] = 0x20;   // 4 KB Sector Erase
     cmd[1] = (addr >> 16) & 0xFF;
     cmd[2] = (addr >> 8) & 0xFF;
     cmd[3] = addr & 0xFF;
 
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    flash_write_enable();
 
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+    flash_wait_busy();
+}
+
+void flash_page_program(uint32_t addr, uint8_t *data, uint16_t len)
+{
+    uint8_t cmd[4];
+
+    if (len == 0 || len > 256)
+    {
+        return;
+    }
+
+    flash_wait_busy();
+
+    cmd[0] = 0x02;   // Page Program
+    cmd[1] = (addr >> 16) & 0xFF;
+    cmd[2] = (addr >> 8) & 0xFF;
+    cmd[3] = addr & 0xFF;
+
+    flash_write_enable();
+
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
     HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
     HAL_SPI_Transmit(&hspi2, data, len, 100);
-
     PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-}
-
-void flash_write_enable(void)
-{
-    uint8_t cmd = 0x06;
-
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-}
-
-void flash_write_disable(void)
-{
-    uint8_t cmd = 0x04;
-
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-}
-
-static uint8_t flash_read_status(void)
-{
-    uint8_t tx[2] = {0x05,0x00};
-    uint8_t rx[2] = {0};
-
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_TransmitReceive(&hspi2, tx, rx, 2, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-
-    return rx[1];
 }
 
 void flash_read(uint32_t addr, uint8_t *data, uint16_t len)
 {
     uint8_t cmd[4];
 
-    cmd[0] = 0x03;                     // READ command
+    flash_wait_busy();
+
+    cmd[0] = 0x03;   // Read
     cmd[1] = (addr >> 16) & 0xFF;
     cmd[2] = (addr >> 8) & 0xFF;
     cmd[3] = addr & 0xFF;
 
     PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-
     HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
     HAL_SPI_Receive(&hspi2, data, len, 100);
-
     PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+}
+
+void flash_write_enable(void)
+{
+    uint8_t cmd = 0x06;   // Write Enable
+
+    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+}
+
+static void flash_wait_busy(void)
+{
+    while (flash_read_status() & 0x01)   // BUSY bit
+    {
+        __NOP();
+    }
+}
+
+
+static uint8_t flash_read_status(void)
+{
+	uint8_t cmd = 0x05;   // Read Status Register
+	uint8_t status = 0;
+
+	PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+	HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+	HAL_SPI_Receive(&hspi2, &status, 1, 100);
+	PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
+
+	return status;
 }
 
 /*------------------ GPS functions -----------------*/
