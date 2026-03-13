@@ -12,7 +12,11 @@
   * This software is licensed under terms that can be found in the LICENSE file
   * in the root directory of this software component.
   * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  *TODO: Check GPS code once antenna is working
+  *TODO: Test pack buffer command
+  *TODO: Create page append commad to place tx buffer in a 256byte page buffer
+  *TODO: Make flash code for transmitting 256 bytes
+  *TODO: Make GPS RX with DMA
   ******************************************************************************
 **/
 
@@ -41,24 +45,84 @@
 #define IMU_REG_WHO_AM_I    	(0x0F)
 #define IMU_WHO_AM_I_VAL  		(0x73)
 
+#define ID_MSB          0
+#define ID_LSB          1
+
+#define LAT_DEG         2
+#define LAT_MIN_LSB     3
+#define LAT_MIN_MSB     4
+#define LON_DEG         5
+#define LON_MIN_LSB     6
+#define LON_MIN_MSB     7
+
+#define TEMP_LSB        8
+#define TEMP_MSB        9
+#define PRES_LSB        10
+#define PRES_MSB        11
+
+#define LG_X_LSB        12
+#define LG_X_MSB        13
+#define LG_Y_LSB        14
+#define LG_Y_MSB        15
+#define LG_Z_LSB        16
+#define LG_Z_MSB        17
+
+#define HG_X_LSB        18
+#define HG_X_MSB        19
+#define HG_Y_LSB        20
+#define HG_Y_MSB        21
+#define HG_Z_LSB        22
+#define HG_Z_MSB        23
+
+#define GY_P_LSB        24
+#define GY_P_MSB        25
+#define GY_R_LSB        26
+#define GY_R_MSB        27
+#define GY_Y_LSB        28
+#define GY_Y_MSB        29
+
+#define T_STAMP_1       30
+#define T_STAMP_2       31
+#define T_STAMP_3       32
+#define T_STAMP_4       33
+
+#define FLAGS           34		//Bits 0-3 continuity checking, Bits 4-7 are rocket state
+#define CRC8         	35
+
+#define PKT_LEN        36
+
 
 /* Private macro -------------------------------------------------------------*/
 #define PIN_LOW(port, pin)   		HAL_GPIO_WritePin((port), (pin), GPIO_PIN_RESET)
 #define PIN_HIGH(port, pin)  		HAL_GPIO_WritePin((port), (pin), GPIO_PIN_SET)
 
-#define FLASH_WP_ENABLE_PROTECT()	HAL_GPIO_WritePin(FLASH_WP_GPIO_Port, FLASH_WP_Pin, GPIO_PIN_RESET)
-#define FLASH_WP_DISABLE_PROTECT()	HAL_GPIO_WritePin(FLASH_WP_GPIO_Port, FLASH_WP_Pin, GPIO_PIN_SET)
-
 #define GPS_FIX_READ()  	 		(HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin) == GPIO_PIN_SET)
 
+#define PAK_U16(buf, idx_lsb, v) do {              \
+  (buf)[(idx_lsb)]     = (uint8_t)((v) & 0xFF);    \
+  (buf)[(idx_lsb) + 1] = (uint8_t)((v) >> 8);      \
+} while(0)
+
+#define PAK_U32(buf, idx0, v) do {                 \
+  (buf)[(idx0) + 0] = (uint8_t)((v) & 0xFF);       \
+  (buf)[(idx0) + 1] = (uint8_t)(((v) >> 8) & 0xFF);\
+  (buf)[(idx0) + 2] = (uint8_t)(((v) >> 16)&0xFF); \
+  (buf)[(idx0) + 3] = (uint8_t)(((v) >> 24)&0xFF); \
+} while(0)
+
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
+
 TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart2;
+
 PCD_HandleTypeDef hpcd_USB_DRD_FS;
-LPS22HH_Object_t baro;
-stmdev_ctx_t imu_ctx;
+
+extern LPS22HH_Object_t baro;
 
 //Test Variables
 static uint8_t  	rx_byte;
@@ -74,6 +138,9 @@ static volatile 	uint16_t g_timeStamp = 0;		//Keeps track of time in 100's of ms
 static volatile 	uint8_t g_LoRaTx = 0;				//Transmit to LoRa module
 static volatile 	uint8_t g_getData = 1;
 static volatile     uint32_t flash_write_addr = 0;
+static uint8_t tx_buf[PKT_LEN] = {0};
+static uint8_t rx_buf[PKT_LEN] = {0};
+
 
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,26 +166,18 @@ bool rf_read_register(uint16_t addr, uint8_t* val_out);
 static bool llcc68_wait_while_busy(uint32_t timeout_ms);
 
 //User defined functions
-int barom_init(void);
-int barom_read(float *p_pres, float *p_temp);
-int imu_init(void);
-int imu_read(int16_t lowG[3], int16_t highG[3], int16_t gyro[3]);
-void flash_page_program(uint32_t addr, uint8_t *data, uint16_t len);
-void flash_write_enable(void);
 static void light_apogee_pyro(void);
 static void light_main_pyro(void);
 static inline uint16_t float_to_u16(float x, float scale, float offset);
-static inline void pack_buf(uint8_t tx_buf[32],
-                          const int16_t lowG[3],
-                          const int16_t highG[3],
-                          const int16_t gyro[3],
-                          uint16_t pres,
-                          uint16_t temp);
-static uint8_t flash_read_status(void);
-static void flash_wait_busy(void);
-void flash_read(uint32_t addr, uint8_t *data, uint16_t len);
-void flash_init(void);
-void flash_sector_erase(uint32_t addr);
+static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
+                            uint8_t lat_deg, uint16_t lat_min,
+                            uint8_t lon_deg, uint16_t lon_min,
+                            const int16_t lowG[3],
+                            const int16_t highG[3],
+                            const int16_t gyro[3],
+                            uint16_t pres,
+                            uint16_t temp,
+                            uint8_t flags);
 
 /*-------------------------------------------------------------------------------*/
 
@@ -147,22 +206,22 @@ int main(void)
   //test_all();						//Test sensors
 
   /* Initialize all sensors */
-  barom_init();
-  imu_init();
-  flash_write_enable();
+  uint8_t status = barom_init();
+  __NOP();
+  status = imu_init();
+  __NOP();
+  flash_init();
+  status = flash_read_status();
+  //gps_init();
+
+  // Bit 1 (WEL) should be 0 after write completes
+  // Bits 2-5 are block protection bits - should be 0
 
 
 
   /* Initialize variables, test, and start timer */
   uint8_t dataReady = 0;				//Transmit to flash chip
-    uint8_t tx_buf[32] = {
-      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-      0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0, 0x0F,
-      0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89,
-      0x9A, 0xAB, 0xBC, 0xCD, 0xDE, 0xEF, 0x5A, 0xA5
-  };				//Save data to buffer to transmit. Random values for test
-  uint8_t rx_buf[32] = {0};
-	
+
   uint16_t pres_u16 = 0;
   uint16_t temp_u16 = 0;
 
@@ -172,6 +231,10 @@ int main(void)
 
   float p_hpa = 0;
   float p_tc = 0;
+
+  char gga[128];
+  uint8_t latD, lonD;		//Latitude and longitude degrees
+  uint16_t latM, lonM;		//Latitude and longitude minutes
 
 
   HAL_TIM_Base_Start_IT(&htim3);	//start timer interrupt
@@ -195,7 +258,6 @@ int main(void)
 
 	  if (g_getData)
 	  {
-		  //TODO: add functions for communicating with sensors and saving the obtained data
 
 		  //Read Barom
 		  if (barom_read(&p_hpa, &p_tc) == 0)
@@ -213,6 +275,8 @@ int main(void)
 			//   u16 = round(temp_C * 100 + 0)
 			//   resolution: 0.01 degC / LSB
 			//   expected range: ~1500..3500 for 15..35C indoor
+
+			__NOP();
 		  }
 		  else
 		  {
@@ -222,11 +286,12 @@ int main(void)
 
 
 		  //Read IMU
-		  if (imu_read(s_lowG, s_highG, s_gyro) == 0)
+		 if (imu_read(s_lowG, s_highG, s_gyro) == 0)
 		  {
 			  // lowG ~ (0,0, +something) when sitting still
 			  // gyro ~ (0,0,0) when not rotating
 			  // highG ~ (0,0,0) unless you smack it / vibrate it
+			  __NOP();
 		  }
 		  else
 		  {
@@ -235,16 +300,30 @@ int main(void)
 		  }
 
 
-		  //Read GPS
+		 //Read GPS
+//		 if (gps_get_data(gga, sizeof(gga), 3000))
+//		 {
+//		     // gga now has some NMEA line
+//		 }
+//		 if (!strncmp(gga, "$GNGGA,", 7) || !strncmp(gga, "$GPGGA,", 7))
+//		 {
+//		     if (gps_gga(gga, &latD, &latM, &lonD, &lonM))
+//		     {
+//		         // pack
+//		     }
+//		 }
 
 		  dataReady = 1;		//add error checking to set data ready to 0 in case of incorrect/corrupted data
 		  g_getData = 0;
 	  }
-		
+
 	  if (dataReady)
 	  {
 		  //Create buffer to be sent
-		  pack_buf(tx_buf, s_lowG, s_highG, s_gyro, pres_u16, temp_u16);
+		  pack_buf(tx_buf, latD, latM, lonD, lonM, s_lowG, s_highG, s_gyro, pres_u16, temp_u16, 0);
+
+		  __NOP();
+
 
 		  if(g_LoRaTx)
 		  {
@@ -257,17 +336,25 @@ int main(void)
 		  //Transmit latest data packet to flash chip
 		  if (flash_write_addr < 0xFFFFFF)
 		  {
+			  flash_sector_erase(0x000000);		//Erase flash chip before writing to it
 			  flash_page_program(flash_write_addr, tx_buf, sizeof(tx_buf));
-			  flash_write_addr += sizeof(tx_buf);
+			  //flash_write_addr += sizeof(tx_buf);
 		  }
-
-		  memset(tx_buf, 0, sizeof(tx_buf));		//Clear data buffer
+		  else
+		  {
+			  //Flash chip is full, end program?
+		  }
 
 		  dataReady = 0;
 	  }
+
+	  HAL_Delay(100);
+	  //after main loop, read first flight packet
 	  flash_read(0x000000, rx_buf, 32);
 	  __NOP();
+
   }
+
 }
 
 
@@ -280,7 +367,7 @@ int main(void)
 
 static void light_apogee_pyro(void)
 {
-  // Set PC6-9 HIGH
+  // Set PC6 and 7 HIGH
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_SET);
 
   g_pyroActive = 1;
@@ -289,7 +376,7 @@ static void light_apogee_pyro(void)
 
 static void light_main_pyro(void)
 {
-  // Set PC6-9 HIGH
+  // Set PC8 and 9 HIGH
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
 
   g_pyroActive = 1;
@@ -309,315 +396,48 @@ static inline uint16_t float_to_u16(float value, float scale, float offset)
   return (uint16_t)u16_value;
 }
 
-static inline void pack_buf(uint8_t tx_buf[32],
-                          const int16_t lowG[3],
-                          const int16_t highG[3],
-                          const int16_t gyro[3],
-                          uint16_t pres,
-                          uint16_t temp)
+static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
+                            uint8_t lat_deg, uint16_t lat_min,
+                            uint8_t lon_deg, uint16_t lon_min,
+                            const int16_t lowG[3],
+                            const int16_t highG[3],
+                            const int16_t gyro[3],
+                            uint16_t pres,
+                            uint16_t temp,
+                            uint8_t flags)
 {
-    uint16_t index = 0;
+    // while debugging: start from a known state
+	memset(tx_buf, 0, PKT_LEN);
 
-    tx_buf[index++] = (uint8_t)(g_timeStamp & 0xFF);
-    tx_buf[index++] = (uint8_t)(g_timeStamp >> 8); 												 // 2
+	// ID
+	tx_buf[ID_MSB] = 0xAA;
+	tx_buf[ID_LSB] = 0xAA;
 
-    memcpy(&tx_buf[index], lowG,  sizeof(int16_t) * 3); index += sizeof(int16_t) * 3;        // +6 = 8
-    memcpy(&tx_buf[index], highG, sizeof(int16_t) * 3); index += sizeof(int16_t) * 3;        // +6 = 14
-    memcpy(&tx_buf[index], gyro,  sizeof(int16_t) * 3); index += sizeof(int16_t) * 3;        // +6 = 20
+	// GPS degrees/minutes
+	tx_buf[LAT_DEG] = lat_deg;
+	PAK_U16(tx_buf, LAT_MIN_LSB, lat_min);
 
-    memcpy(&tx_buf[index], &pres, sizeof(pres)); index += sizeof(pres);                      // +2 = 22
-    memcpy(&tx_buf[index], &temp, sizeof(temp)); index += sizeof(temp);                      // +2 = 24
+	tx_buf[LON_DEG] = lon_deg;
+	PAK_U16(tx_buf, LON_MIN_LSB, lon_min);
 
-    // remaining bytes are free for flags, checksum, and other data
+	// Temp / Pressure
+	PAK_U16(tx_buf, TEMP_LSB, temp);
+	PAK_U16(tx_buf, PRES_LSB, pres);
+
+	// IMU vectors (STM32 is little-endian; memcpy is fine and fast)
+	memcpy(&tx_buf[LG_X_LSB], lowG,  3 * sizeof(int16_t));   // X/Y/Z
+	memcpy(&tx_buf[HG_X_LSB], highG, 3 * sizeof(int16_t));
+	memcpy(&tx_buf[GY_P_LSB], gyro,  3 * sizeof(int16_t));
+
+	// Timestamp (4 bytes)
+	PAK_U32(tx_buf, T_STAMP_1, g_timeStamp);
+
+	// Flags
+	tx_buf[FLAGS] = flags;
+
+	// CRC placeholder
+	tx_buf[CRC8] = 0;
 }
-
-/*------------------ Barometer functions -----------------*/
-
-static int32_t barom_platform_read(uint16_t Address, uint16_t Reg, uint8_t *pData, uint16_t Length)
-{
-  (void)Address;
-
-  uint8_t addr = (uint8_t)((uint8_t)Reg | SPI_READ_BIT);
-
-  PIN_LOW(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-
-  if (HAL_SPI_Transmit(&hspi1, &addr, 1, 100) != HAL_OK) goto err;
-  if (HAL_SPI_Receive(&hspi1, pData, Length, 100) != HAL_OK) goto err;
-
-  PIN_HIGH(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-  return 0;
-
-err:
-  PIN_HIGH(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-  return -1;
-}
-
-static int32_t barom_platform_write(uint16_t Address, uint16_t Reg, uint8_t *pData, uint16_t Length)
-{
-  (void)Address;
-
-  uint8_t addr = (uint8_t)Reg; // no bits added
-
-  PIN_LOW(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-
-  if (HAL_SPI_Transmit(&hspi1, &addr, 1, 100) != HAL_OK) goto err;
-  if (HAL_SPI_Transmit(&hspi1, pData, Length, 100) != HAL_OK) goto err;
-
-  PIN_HIGH(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-  return 0;
-
-err:
-  PIN_HIGH(SPI1_CS_BAROM_GPIO_Port, SPI1_CS_BAROM_Pin);
-  return -1;
-}
-
-
-
-int barom_init(void)
-{
-  LPS22HH_IO_t io = {
-    .Init     = 0,
-    .DeInit   = 0,
-    .BusType  = LPS22HH_SPI_4WIRES_BUS,
-    .Address  = 0, // ignored for SPI
-    .WriteReg = barom_platform_write,
-    .ReadReg  = barom_platform_read,
-    .GetTick  = (int32_t(*)(void))HAL_GetTick,
-    .Delay    = HAL_Delay
-  };
-
-  if (LPS22HH_RegisterBusIO(&baro, &io) != LPS22HH_OK) return -1;
-  if (LPS22HH_Init(&baro) != LPS22HH_OK) return -2;
-
-  // Pick an ODR (Hz). 25 Hz is a good start
-  if (LPS22HH_PRESS_SetOutputDataRate(&baro, 50.0f) != LPS22HH_OK) return -3;	//Pressure and Temp share the same ODR
-
-  // This starts continuous conversions
-  if (LPS22HH_PRESS_Enable(&baro) != LPS22HH_OK) return -4;
-  if (LPS22HH_TEMP_Enable(&baro) != LPS22HH_OK) return -5;
-
-  return 0; // initialized (note: still power-down until BAROM_Start called)
-}
-
-
-int barom_read(float *p_hpa, float *p_tc)
-{
-  if (!p_hpa || !p_tc) return -1;
-
-  if (LPS22HH_PRESS_GetPressure(&baro, p_hpa) != LPS22HH_OK) return -2;
-  if (LPS22HH_TEMP_GetTemperature(&baro, p_tc) != LPS22HH_OK) return -3;
-
-  return 0;
-}
-
-/*------------------ IMU functions -----------------*/
-
-static int32_t imu_platform_read(void *handle, uint8_t reg, uint8_t *data, uint16_t len)
-{
-  (void)handle;
-
-  // For ST SPI: reg | 0x80 => read, reg | 0x40 => auto-inc (multi-byte)
-  uint8_t addr = reg | SPI_READ_BIT;
-  if (len > 1U) addr |= SPI_AUTO_INC;
-
-  PIN_LOW(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-
-  if (HAL_SPI_Transmit(&hspi1, &addr, 1, 100) != HAL_OK) goto err;
-  if (HAL_SPI_Receive(&hspi1, data, len, 100) != HAL_OK) goto err;
-
-  PIN_HIGH(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-  return 0;
-
-err:
-  PIN_HIGH(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-  return -1;
-}
-
-static int32_t imu_platform_write(void *handle, uint8_t reg, uint8_t *data, uint16_t len)
-{
-  (void)handle;
-
-  uint8_t addr = reg;
-  if (len > 1U) addr |= SPI_AUTO_INC;
-
-  PIN_LOW(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-
-  if (HAL_SPI_Transmit(&hspi1, &addr, 1, 100) != HAL_OK) goto err;
-  if (HAL_SPI_Transmit(&hspi1, (uint8_t*)data, len, 100) != HAL_OK) goto err;
-
-  PIN_HIGH(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-  return 0;
-
-err:
-  PIN_HIGH(SPI1_CS_IMU_GPIO_Port, SPI1_CS_IMU_Pin);
-  return -1;
-}
-
-int imu_init(void)
-{
-  imu_ctx.write_reg = imu_platform_write;
-  imu_ctx.read_reg  = imu_platform_read;
-  imu_ctx.mdelay    = (stmdev_mdelay_ptr)HAL_Delay;
-  imu_ctx.handle    = NULL;
-
-  lsm6dsv80x_block_data_update_set(&imu_ctx, 1);
-
-  // Set output data rates (pick something simple for testing)
-  // Low-g accel ODR
-  if (lsm6dsv80x_xl_setup(&imu_ctx, LSM6DSV80X_ODR_AT_120Hz, LSM6DSV80X_XL_HIGH_PERFORMANCE_MD) != 0) return -1; // enum is in reg.h
-  //High-g accel ODR
-  if (lsm6dsv80x_hg_xl_data_rate_set(&imu_ctx, LSM6DSV80X_ODR_AT_240Hz, 1) != 0) return -2;
-  // Gyro ODR
-  if (lsm6dsv80x_gy_setup(&imu_ctx, LSM6DSV80X_ODR_AT_120Hz, LSM6DSV80X_GY_HIGH_PERFORMANCE_MD) != 0) return -3;
-
-  //set scale for each measurement (full scale)
-  if (lsm6dsv80x_xl_full_scale_set(&imu_ctx, LSM6DSV80X_16g) != 0) return -4;
-  if (lsm6dsv80x_gy_full_scale_set(&imu_ctx, LSM6DSV80X_2000dps) != 0) return -5;
-  if (lsm6dsv80x_hg_xl_full_scale_set(&imu_ctx, LSM6DSV80X_80g) != 0) return -6;
-
-  return 0;
-}
-
-int imu_read(int16_t lowG[3], int16_t highG[3], int16_t gyro[3])
-{
-  if (!lowG || !highG || !gyro) return -1;
-
-
-  if (lsm6dsv80x_acceleration_raw_get(&imu_ctx, lowG) != 0) return -3;
-  if (lsm6dsv80x_angular_rate_raw_get(&imu_ctx, gyro) != 0) return -4;
-  if (lsm6dsv80x_hg_acceleration_raw_get(&imu_ctx, highG) != 0) return -5;
-
-  return 0;
-}
-/*------------------ Flash functions -----------------*/
-
-void flash_init(void)
-{
-    uint8_t cmd;
-    uint8_t jedec[3] = {0};
-
-    // Disable hardware write protection
-    FLASH_WP_DISABLE_PROTECT();
-
-    __NOP();
-
-    flash_write_enable();
-
-    flash_wait_busy();
-
-    // Global Block Protection Unlock
-    cmd = 0x98;   //Global Block Protection Unlock Command
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-
-    // Wait until device is no longer busy
-    flash_wait_busy();
-
-    //sanity check: read JEDEC ID
-    cmd = 0x9F;   // JEDEC ID Read Command
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-    HAL_SPI_Receive(&hspi2, jedec, 3, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-
-    __NOP();		//Check ID Here
-}
-
-void flash_sector_erase(uint32_t addr)
-{
-    uint8_t cmd[4];
-
-    cmd[0] = 0x20;   // 4 KB Sector Erase
-    cmd[1] = (addr >> 16) & 0xFF;
-    cmd[2] = (addr >> 8) & 0xFF;
-    cmd[3] = addr & 0xFF;
-
-    flash_write_enable();
-
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-
-    flash_wait_busy();
-}
-
-void flash_page_program(uint32_t addr, uint8_t *data, uint16_t len)
-{
-    uint8_t cmd[4];
-
-    if (len == 0 || len > 256)
-    {
-        return;
-    }
-
-    flash_wait_busy();
-
-    cmd[0] = 0x02;   // Page Program
-    cmd[1] = (addr >> 16) & 0xFF;
-    cmd[2] = (addr >> 8) & 0xFF;
-    cmd[3] = addr & 0xFF;
-
-    flash_write_enable();
-
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
-    HAL_SPI_Transmit(&hspi2, data, len, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-}
-
-void flash_read(uint32_t addr, uint8_t *data, uint16_t len)
-{
-    uint8_t cmd[4];
-
-    flash_wait_busy();
-
-    cmd[0] = 0x03;   // Read
-    cmd[1] = (addr >> 16) & 0xFF;
-    cmd[2] = (addr >> 8) & 0xFF;
-    cmd[3] = addr & 0xFF;
-
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
-    HAL_SPI_Receive(&hspi2, data, len, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-}
-
-void flash_write_enable(void)
-{
-    uint8_t cmd = 0x06;   // Write Enable
-
-    PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-    PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-}
-
-static void flash_wait_busy(void)
-{
-    while (flash_read_status() & 0x01)   // BUSY bit
-    {
-        __NOP();
-    }
-}
-
-
-static uint8_t flash_read_status(void)
-{
-	uint8_t cmd = 0x05;   // Read Status Register
-	uint8_t status = 0;
-
-	PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-	HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-	HAL_SPI_Receive(&hspi2, &status, 1, 100);
-	PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
-
-	return status;
-}
-
-/*------------------ GPS functions -----------------*/
-
-
-/*------------------ LoRa functions -----------------*/
 
 
 /*-------------------------------------------------------------------------------*/
@@ -740,7 +560,7 @@ static void mx_spi1_init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -770,10 +590,10 @@ static void mx_spi2_init(void)
   hspi2.Init.Mode = SPI_MODE_MASTER;
   hspi2.Init.Direction = SPI_DIRECTION_2LINES;
   hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;
-  hspi2.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -804,7 +624,7 @@ static void mx_tim3_init(void)
 	htim3.Instance = TIM3;
 	htim3.Init.Prescaler = 31999;                 // 32MHz/32000 = 1kHz (1ms tick)
 	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim3.Init.Period = 9;                       // 100ms
+	htim3.Init.Period = 99;                       // 100ms
 	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
 	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
@@ -1122,20 +942,20 @@ void pyro_test(void){
 
 void flash_read_id(uint8_t id[3])
 {
-	FLASH_WP_DISABLE_PROTECT();	//Disable protect to write to flash chip
     PIN_LOW(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
     for (volatile int i = 0; i < 200; i++) __NOP(); // ~ a few µs depending on clock
 
-    uint8_t tx[4] = {0x9F, 0x00, 0x00, 0x00};
+    uint8_t tx[4] = {0x9f, 0x00, 0x00};
     uint8_t rx[4] = {0};
 
     HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4, 100);
 
     PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
 
-    id[0] = rx[1];
-    id[1] = rx[2];
-    id[2] = rx[3];
+    id[0] = rx[0];
+    id[1] = rx[1];
+    id[2] = rx[2];
+
 
     //FLASH_WP_ENABLE_PROTECT();	//Disable protect to write to flash chip
     return (st == HAL_OK);
