@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+\/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.h
@@ -97,7 +97,27 @@ void Error_Handler(void);
 #define SPI1_CS_BAROM_GPIO_Port GPIOC
 #define SPI1_CS_IMU_Pin GPIO_PIN_2
 #define SPI1_CS_IMU_GPIO_Port GPIOD
+#define LED1_GPIO_Port 	GPIOB
+#define LED1_Pin       	GPIO_PIN_15
+#define LED2_GPIO_Port 	GPIOB
+#define LED2_Pin       	GPIO_PIN_14
+#define LED3_GPIO_Port 	GPIOB
+#define LED3_Pin       	GPIO_PIN_13
+#define LED4_GPIO_Port 	GPIOB
+#define LED4_Pin       	GPIO_PIN_12
+#define FLASH_CS_GPIO 	GPIOC
+#define FLASH_CS_PIN  	GPIO_PIN_11
 
+#define SPI_READ_BIT   			(0x80)
+#define SPI_AUTO_INC   			(0x40)
+
+#define BAROM_REG_WHO_AM_I  	(0x0F)
+#define BAROM_WHO_AM_I_VAL   	(0xB3)
+
+#define IMU_REG_WHO_AM_I    	(0x0F)
+#define IMU_WHO_AM_I_VAL  		(0x73)
+
+#define PKT_LEN        36
 
 #ifdef __cplusplus
 }
