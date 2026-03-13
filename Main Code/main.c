@@ -336,7 +336,7 @@ int main(void)
 		  //Transmit latest data packet to flash chip
 		  if (flash_write_addr < 0xFFFFFF)
 		  {
-			  flash_sector_erase(0x000000);		//Erase flash chip before writing to it
+			  flash_sector_erase(flash_write_addr);		//Erase flash chip before writing to it
 			  flash_page_program(flash_write_addr, tx_buf, sizeof(tx_buf));
 			  //flash_write_addr += sizeof(tx_buf);
 		  }
