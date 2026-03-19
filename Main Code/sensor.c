@@ -27,6 +27,7 @@ extern UART_HandleTypeDef huart2;
 #define PAGE_SIZE      256
 #define PKTS_PER_PAGE  7
 #define PAGE_DATA_LEN  (PKT_LEN * PKTS_PER_PAGE)  // 252
+#define FLASH_SECTOR_SIZE 4096    // Sector size in bytes
 
 // Footer indices:
 #define PAGE_SEQ_LSB   252
@@ -354,6 +355,40 @@ uint8_t flash_read_status(void)
 	PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
 
 	return status;
+}
+
+void flash_write_txbuf(uint32_t *flash	_write_addr, uint8_t *tx_buf, uint32_t len)
+{
+    uint32_t remaining = len;
+    uint32_t offset = 0;
+
+    while (remaining > 0)
+    {
+        // Calculate remaining space in the current page
+        uint32_t page_offset = (*flash_write_addr) % FLASH_PAGE_SIZE;
+        uint32_t space_in_page = FLASH_PAGE_SIZE - page_offset;
+
+        // Determine how much to write this iteration
+        uint32_t write_size = (remaining < space_in_page) ? remaining : space_in_page;
+
+        // Erase the sector if starting at a sector boundary
+        if (((*flash_write_addr) % FLASH_SECTOR_SIZE) == 0)
+        {
+            flash_sector_erase(*flash_write_addr);
+            flash_wait_busy();
+        }
+
+        // Program the page
+        flash_page_program(*flash_write_addr, &tx_buf[offset], write_size);
+        flash_wait_busy();
+
+        // Advance address and buffer offset
+        *flash_write_addr += write_size;
+        offset += write_size;
+        remaining -= write_size;
+
+        // If we filled a page, the next iteration automatically continues to the next page
+    }
 }
 
 
