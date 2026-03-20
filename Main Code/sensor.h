@@ -22,6 +22,8 @@ void flash_read(uint32_t addr, uint8_t *data, uint16_t len);
 void flash_init(void);
 void flash_sector_erase(uint32_t addr);
 uint8_t flash_read_status(void);
+void flash_write_txbuf(uint32_t *flash	_write_addr, uint8_t *tx_buf, uint32_t len);
+
 
 void gps_init(void);
 int gps_gga(const char *gga,
