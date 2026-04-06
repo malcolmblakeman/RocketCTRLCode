@@ -45,8 +45,17 @@
 #define IMU_REG_WHO_AM_I    	(0x0F)
 #define IMU_WHO_AM_I_VAL  		(0x73)
 
-#define ID_MSB          0
-#define ID_LSB          1
+//STATE (BIT enables)
+/* 0 = PAD
+1 = BOOST
+2 = COAST
+3 = APOGEE_DETECTED
+4 = DROGUE_FIRED
+5 = DESCENT
+6 = MAIN_FIRED
+7 = LANDED / DONE */
+#define STATE          	0
+#define CONT          	1
 
 #define LAT_DEG         2
 #define LAT_MIN_LSB     3
@@ -55,39 +64,39 @@
 #define LON_MIN_LSB     6
 #define LON_MIN_MSB     7
 
-#define TEMP_LSB        8
-#define TEMP_MSB        9
-#define PRES_LSB        10
-#define PRES_MSB        11
+#define VELO_LSB        8
+#define VELO_MSB        9
+#define ALT_LSB        10
+#define ALT_MSB        11
 
-#define LG_X_LSB        12
-#define LG_X_MSB        13
-#define LG_Y_LSB        14
-#define LG_Y_MSB        15
-#define LG_Z_LSB        16
-#define LG_Z_MSB        17
+#define LG_X_LSB       12
+#define LG_X_MSB       13
+#define LG_Y_LSB       14
+#define LG_Y_MSB       15
+#define LG_Z_LSB       16
+#define LG_Z_MSB       17
 
-#define HG_X_LSB        18
-#define HG_X_MSB        19
-#define HG_Y_LSB        20
-#define HG_Y_MSB        21
-#define HG_Z_LSB        22
-#define HG_Z_MSB        23
+#define HG_X_LSB       18
+#define HG_X_MSB       19
+#define HG_Y_LSB       20
+#define HG_Y_MSB       21
+#define HG_Z_LSB       22
+#define HG_Z_MSB       23
 
-#define GY_P_LSB        24
-#define GY_P_MSB        25
-#define GY_R_LSB        26
-#define GY_R_MSB        27
-#define GY_Y_LSB        28
-#define GY_Y_MSB        29
+#define GY_P_LSB       24
+#define GY_P_MSB       25
+#define GY_R_LSB       26
+#define GY_R_MSB       27
+#define GY_Y_LSB       28
+#define GY_Y_MSB       29
 
-#define T_STAMP_1       30
-#define T_STAMP_2       31
-#define T_STAMP_3       32
-#define T_STAMP_4       33
+#define T_STAMP_1      30
+#define T_STAMP_2      31
+#define T_STAMP_3      32
+#define T_STAMP_4      33
 
-#define FLAGS           34		//Bits 0-3 continuity checking, Bits 4-7 are rocket state
-#define CRC8         	35
+#define FLAGS          34		//Bits 0-3 continuity checking, Bits 4-7 are rocket state
+#define CRC8		   35
 
 #define PKT_LEN        36
 
@@ -124,6 +133,27 @@ PCD_HandleTypeDef hpcd_USB_DRD_FS;
 
 extern LPS22HH_Object_t baro;
 
+typedef enum
+{
+    FS_PAD = 0,
+    FS_BOOST,
+    FS_COAST,
+    FS_APOGEE,
+    FS_DROGUE_DESCENT,
+    FS_MAIN_DESCENT,
+    FS_LANDED
+} flight_state_t;
+
+typedef struct {
+  float x;      // altitude estimate (m)
+  float v;      // vertical velocity estimate (m/s)
+  float alpha;
+  float beta;
+  uint8_t inited;
+} ABFilter;
+
+static flight_state_t g_flightState = FS_PAD;
+
 //Test Variables
 static uint8_t  	rx_byte;
 static char     	nmea_line[128];
@@ -131,15 +161,20 @@ static volatile 	uint16_t nmea_idx = 0;
 static volatile 	uint8_t  nmea_line_ready = 0;
 
 //Real Program Variables
-static volatile 	uint8_t g_pyroActive = 0;
-static volatile 	uint8_t g_pyroTicks = 0;   		//Determines how long pyro channels on
-static volatile 	uint8_t g_rfTicks = 0;			//Determines how long between every rf tx
-static volatile 	uint16_t g_timeStamp = 0;		//Keeps track of time in 100's of ms
-static volatile 	uint8_t g_LoRaTx = 0;				//Transmit to LoRa module
-static volatile 	uint8_t g_getData = 1;
-static volatile     uint32_t flash_write_addr = 0;
-static uint8_t tx_buf[PKT_LEN] = {0};
-static uint8_t rx_buf[PKT_LEN] = {0};
+static volatile uint8_t 	g_pyroActive = 0;
+static volatile	uint8_t 	g_pyroTicks = 0;   		//Determines how long pyro channels on
+static volatile	uint8_t 	g_rfTicks = 0;			//Determines how long between every rf tx
+static volatile uint32_t 	g_timeStamp = 0;		//Keeps track of time in 100's of ms
+static volatile uint8_t 	g_LoRaTx = 0;			//Transmit to LoRa module
+static volatile uint16_t 	g_pendingSamples = 0;
+static volatile uint32_t 	flash_write_addr = 0;
+static uint8_t 				tx_buf[PKT_LEN] = {0};
+static uint8_t 				lora_buf[PKT_LEN];
+static 						ABFilter g_ab;
+static float 				g_p0_hpa = 0.0f;
+static uint8_t 				g_p0_set = 0;
+
+
 
 
 
@@ -153,6 +188,7 @@ static void mx_spi2_init(void);
 static void mx_usart2_uart_init(void);
 static void mx_usb_pcd_init(void);
 static void mx_tim3_init(void);
+void tim3_set_period_counts(uint16_t arr);
 
 //Sensor test functions
 void test_all(void);
@@ -175,9 +211,12 @@ static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
                             const int16_t lowG[3],
                             const int16_t highG[3],
                             const int16_t gyro[3],
-                            uint16_t pres,
-                            uint16_t temp,
+							float vel,
+							float alt,
                             uint8_t flags);
+static inline void ab_init(ABFilter *f, float x0, float v0, float alpha, float beta);
+static inline void ab_update(ABFilter *f, float z_meas, float dt);
+static inline float pressure_to_alt(float p_hpa, float p0_hpa);
 
 /*-------------------------------------------------------------------------------*/
 
@@ -202,105 +241,81 @@ int main(void)
   mx_usart2_uart_init();
   //mx_usb_pcd_init();
   mx_tim3_init();
+  gps_init();
 
-  //test_all();						//Test sensors
+  test_all();						//Test sensors
+  pyro_test();
 
   /* Initialize all sensors */
-  uint8_t status = barom_init();
-  __NOP();
-  status = imu_init();
-  __NOP();
+  barom_init();
+  imu_init();
   flash_init();
-  status = flash_read_status();
-  //gps_init();
-
-  // Bit 1 (WEL) should be 0 after write completes
-  // Bits 2-5 are block protection bits - should be 0
+  flash_sector_erase(0x000000);
+  //flash_erase_entire_chip();
+  flash_wait_busy();
+  ring_buf_init();
 
 
 
   /* Initialize variables, test, and start timer */
-  uint8_t dataReady = 0;				//Transmit to flash chip
-
   uint16_t pres_u16 = 0;
-  uint16_t temp_u16 = 0;
 
   int16_t s_lowG[3] = {0};
   int16_t s_highG[3] = {0};
   int16_t s_gyro[3] = {0};
 
   float p_hpa = 0;
-  float p_tc = 0;
 
   char gga[128];
-  uint8_t latD, lonD;		//Latitude and longitude degrees
-  uint16_t latM, lonM;		//Latitude and longitude minutes
+  uint8_t  latD = 0xFF, lonD = 0xFF;      // Latitude and longitude degrees
+  uint16_t latM = 0xFFFF, lonM = 0xFFFF;  // Latitude and longitude minutes
 
+  g_p0_set = 0;
+  g_ab.inited = 0;
 
-  HAL_TIM_Base_Start_IT(&htim3);	//start timer interrupt
+  HAL_TIM_Base_Start_IT(&htim3);	//start timer interrupt at 10ms
+
 
   /* START FLIGHT LOOP */
   while (1)
   {
-	  //TODO: Come up with formula for calculating when to ignite parachutes
-	  /* if(Altitude and acceleration == ?)
-	   * {
-	   * light_apogee_pyro();
-	   * }
-	   */
-
-	  //Should this be a timing thing? After apogee parachute is lit, wait 10s then ignite main?
-	  /* if(Altitude and acceleration == ? && g_pyroActive == 0)
-	   * {
-	   * light_main_pyro();
-	   * }
-	   */
-
-	  if (g_getData)
+	  if(g_pendingSamples > 0)
 	  {
+		  g_pendingSamples--;
 
 		  //Read Barom
-		  if (barom_read(&p_hpa, &p_tc) == 0)
+		  if (barom_read(&p_hpa) == 0)
 		  {
-		    // At sea level you should see ~1000 hPa
-			// Should see ~20-30 degrees C
+		    // AB filter update
+			const float dt = 0.01f;
 
-			pres_u16 = float_to_u16(p_hpa, 10.0f, 0.0f);
-			//   input units: hPa
-			//   u16 = round(p_hPa * 10 + 0)
-			//   resolution: 0.1 hPa / LSB
-			//   expected raw range: ~9500..10500 for 950..1050 hPa (weather/altitude dependent)
-			temp_u16 = float_to_u16(p_tc, 100.0f, 0.0f);
-			//   input units: degC
-			//   u16 = round(temp_C * 100 + 0)
-			//   resolution: 0.01 degC / LSB
-			//   expected range: ~1500..3500 for 15..35C indoor
+		    // latch ground/reference pressure once
+		    if (!g_p0_set) {
+		      g_p0_hpa = p_hpa;
+		      g_p0_set = 1;
 
-			__NOP();
-		  }
-		  else
-		  {
-			  //error checking for if getting barom data is unsuccessful
-			  //set error flag
+		      // good starting gains for 10ms
+		      ab_init(&g_ab, 0.0f, 0.0f, 0.20f, 0.05f);
+		    }
+
+		    // convert pressure -> altitude measurement (meters relative to p0)
+		    float alt_meas_m = pressure_to_alt(p_hpa, g_p0_hpa);
+
+		    // update filter
+		    ab_update(&g_ab, alt_meas_m, dt);
 		  }
 
 
 		  //Read IMU
-		 if (imu_read(s_lowG, s_highG, s_gyro) == 0)
+		  if (imu_read(s_lowG, s_highG, s_gyro) == 0)
 		  {
 			  // lowG ~ (0,0, +something) when sitting still
 			  // gyro ~ (0,0,0) when not rotating
 			  // highG ~ (0,0,0) unless you smack it / vibrate it
-			  __NOP();
-		  }
-		  else
-		  {
-			  //error checking for if getting IMU data is unsuccessful
-			  //set error flag
 		  }
 
 
-		 //Read GPS
+		 //TODO: add a "gps_service" function that lets us know every time a new gps line has been parsed. We will only get new gps data every ~100ms
 //		 if (gps_get_data(gga, sizeof(gga), 3000))
 //		 {
 //		     // gga now has some NMEA line
@@ -313,46 +328,83 @@ int main(void)
 //		     }
 //		 }
 
-		  dataReady = 1;		//add error checking to set data ready to 0 in case of incorrect/corrupted data
-		  g_getData = 0;
-	  }
+		  //Flight state machine
+		  switch (g_flightState)
+		  	  {
+		  	  	  case FS_PAD:
+		  	  	  if (1)	//s_lowG[0] > 0
+		  		  {
+		  			  g_flightState = FS_BOOST;
+		  		  }
+		  		  break;
 
-	  if (dataReady)
-	  {
+		  		case FS_BOOST:
+		  		  if (0)//accel < burnout threshold for 3 cycles
+		  		  {
+		  			  g_flightState = FS_COAST;
+		  		  }
+		  		  break;
+
+		  		case FS_COAST:
+		  		  if (0)//altitude > minimum apogee altitude AND velocity < negative threshold for 3 cycles
+		  		  {
+		  			  g_flightState = FS_APOGEE;
+		  		  }
+		  		  break;
+
+		  		case FS_APOGEE:
+		  		  light_apogee_pyro();
+		  		  tim3_set_period_counts(99);
+		  		  g_flightState = FS_DROGUE_DESCENT;
+		  		  break;
+
+		  		case FS_DROGUE_DESCENT:
+		  			if (0)//altidute < main deployment altitude
+		  			{
+		  				light_main_pyro();
+		  				tim3_set_period_counts(999);
+		  				g_flightState = FS_MAIN_DESCENT;
+		  			}
+		  		  break;
+
+		  		case FS_MAIN_DESCENT:
+		  			if (0)//altidude is AROUND ground level and accel is less than threshold
+		  			{
+		  				g_flightState = FS_LANDED;
+		  			}
+		  			break;
+
+		  		case FS_LANDED:
+		  			//transmit the rest of the stored data
+		  		default:
+		  			break;
+		  	  }
+
 		  //Create buffer to be sent
-		  pack_buf(tx_buf, latD, latM, lonD, lonM, s_lowG, s_highG, s_gyro, pres_u16, temp_u16, 0);
+		  if (g_flightState != FS_PAD)
+		  {
+			  pack_buf(tx_buf, latD, latM, lonD, lonM, s_lowG, s_highG, s_gyro, g_ab.v, g_ab.x, (uint8_t)g_flightState);
+		      write_ring_buf(tx_buf, PKT_LEN);
+		  }
+		  if (flash_ring_overflowed())
+		  {
+			  HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET);
+		  }
 
-		  __NOP();
-
-
-		  if(g_LoRaTx)
+		  if((g_flightState != FS_PAD) && g_LoRaTx)
 		  {
 			  //TODO: Function for transmitting data over LoRa
 			  //Transmit latest data packet over LoRa
+			  memcpy(lora_buf, tx_buf, PKT_LEN);
 			  g_LoRaTx = 0;
 		  }
 
-		  //TODO: Function for transmitting data to flash
-		  //Transmit latest data packet to flash chip
-		  if (flash_write_addr < 0xFFFFFF)
-		  {
-			  flash_sector_erase(flash_write_addr);		//Erase flash chip before writing to it
-			  flash_page_program(flash_write_addr, tx_buf, sizeof(tx_buf));
-			  //flash_write_addr += sizeof(tx_buf);
-		  }
-		  else
-		  {
-			  //Flash chip is full, end program?
-		  }
-
-		  dataReady = 0;
+		  memset(tx_buf, 0xFF, PKT_LEN);
 	  }
 
-	  HAL_Delay(100);
-	  //after main loop, read first flight packet
-	  flash_read(0x000000, rx_buf, 32);
-	  __NOP();
-
+	  //gps_service();
+	  //LoRa_Service();
+	  service_ring();
   }
 
 }
@@ -402,16 +454,16 @@ static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
                             const int16_t lowG[3],
                             const int16_t highG[3],
                             const int16_t gyro[3],
-                            uint16_t pres,
-                            uint16_t temp,
+							float vel,
+							float alt,
                             uint8_t flags)
 {
     // while debugging: start from a known state
 	memset(tx_buf, 0, PKT_LEN);
 
 	// ID
-	tx_buf[ID_MSB] = 0xAA;
-	tx_buf[ID_LSB] = 0xAA;
+	tx_buf[STATE] = (uint8_t)g_flightState;;
+	tx_buf[CONT] = 0xBB;
 
 	// GPS degrees/minutes
 	tx_buf[LAT_DEG] = lat_deg;
@@ -420,9 +472,15 @@ static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
 	tx_buf[LON_DEG] = lon_deg;
 	PAK_U16(tx_buf, LON_MIN_LSB, lon_min);
 
-	// Temp / Pressure
-	PAK_U16(tx_buf, TEMP_LSB, temp);
-	PAK_U16(tx_buf, PRES_LSB, pres);
+	// Altitude / Velocity
+	int16_t vel_cms = (int16_t)lroundf(vel * 100.0f);  // m/s -> cm/s
+	int16_t alt_cm  = (int16_t)lroundf(alt * 100.0f);  // m -> cm
+
+	uint16_t vel_u16 = (uint16_t)vel_cms; // preserve bits
+	uint16_t alt_u16 = (uint16_t)alt_cm;
+
+	PAK_U16(tx_buf, VELO_LSB, vel_u16);
+	PAK_U16(tx_buf, ALT_LSB, alt_u16);
 
 	// IMU vectors (STM32 is little-endian; memcpy is fine and fast)
 	memcpy(&tx_buf[LG_X_LSB], lowG,  3 * sizeof(int16_t));   // X/Y/Z
@@ -432,13 +490,41 @@ static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
 	// Timestamp (4 bytes)
 	PAK_U32(tx_buf, T_STAMP_1, g_timeStamp);
 
-	// Flags
+	// CONT
 	tx_buf[FLAGS] = flags;
 
 	// CRC placeholder
-	tx_buf[CRC8] = 0;
+	tx_buf[CRC8] = 0xFF;
 }
 
+
+static inline void ab_init(ABFilter *f, float x0, float v0, float alpha, float beta)
+{
+  f->x = x0;
+  f->v = v0;
+  f->alpha = alpha;
+  f->beta  = beta;
+  f->inited = 1;
+}
+
+static inline void ab_update(ABFilter *f, float z_meas, float dt)
+{
+  // predict
+  float x_pred = f->x + f->v * dt;
+
+  // residual
+  float r = z_meas - x_pred;
+
+  // correct
+  f->x = x_pred + f->alpha * r;
+  f->v = f->v + (f->beta * r / dt);
+}
+
+static inline float pressure_to_alt(float p_hpa, float p0_hpa)
+{
+  // altitude relative to p0 (meters)
+  return 44330.0f * (1.0f - powf(p_hpa / p0_hpa, 0.190294957f));
+}
 
 /*-------------------------------------------------------------------------------*/
 
@@ -450,8 +536,8 @@ static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
 /* 100ms Delay Logic */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
+	g_pendingSamples++;
 	g_timeStamp++;		//Keeps track of time in 100's of ms
-	g_getData = 1;
 
 	/* Pyro channel control logic */
 	if (g_pyroActive)
@@ -472,7 +558,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		g_LoRaTx = 1;
 		g_rfTicks = 0;
 	}
-	// Toggle LED1
+	//Toggle LED1 for testing
 	HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);	//Probe and test with scope if actually 10ms
 }
 
@@ -624,7 +710,7 @@ static void mx_tim3_init(void)
 	htim3.Instance = TIM3;
 	htim3.Init.Prescaler = 31999;                 // 32MHz/32000 = 1kHz (1ms tick)
 	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim3.Init.Period = 99;                       // 100ms
+	htim3.Init.Period = 9;                       // 100ms
 	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
 	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
@@ -636,6 +722,18 @@ static void mx_tim3_init(void)
 	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
 	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
 	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) Error_Handler();
+}
+
+void tim3_set_period_counts(uint16_t arr)
+{
+    HAL_TIM_Base_Stop_IT(&htim3);
+
+    __HAL_TIM_SET_PRESCALER(&htim3, 31999);
+    __HAL_TIM_SET_AUTORELOAD(&htim3, arr);
+    __HAL_TIM_SET_COUNTER(&htim3, 0);
+    __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
+
+    HAL_TIM_Base_Start_IT(&htim3);
 }
 
 
@@ -833,6 +931,33 @@ static void mx_gpio_init(void)
 
 void test_all(void){
 
+
+	/* GPS TEST-------------------------------*/
+	 while(1){
+		 char line[128];
+		 uint8_t gpsTest;
+
+		 if (gps_readoneline(line, sizeof(line), 3000))
+		 {
+			 gpsTest = 1;      // line contains a clean "$G....\r\n"
+			 // breakpoint: inspect line
+		 }
+		 else
+		 {
+			 gpsTest = 0;
+		 }
+
+		 if (HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin) == 1)
+		 {
+			 HAL_GPIO_WritePin((LED1_GPIO_Port), (LED1_Pin), GPIO_PIN_SET);
+			 HAL_GPIO_WritePin((LED2_GPIO_Port), (LED2_Pin), GPIO_PIN_SET);
+			 HAL_GPIO_WritePin((LED3_GPIO_Port), (LED3_Pin), GPIO_PIN_SET);
+			 HAL_GPIO_WritePin((LED4_GPIO_Port), (LED4_Pin), GPIO_PIN_SET);
+		 }
+
+		 __NOP();
+	 }
+
 	  /* FLASH TEST--------------------------*/
 	  uint8_t id[3] = {0};
 	  flash_read_id(id);			//Function for reading ID for flash chip
@@ -862,36 +987,6 @@ void test_all(void){
 	  (void)whoIMU;
 
 
-
-	  const char *cmd = "$PMTK104*37\r\n";
-	  HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 100);
-
-
-	  /* GPS TEST-------------------------------*/
-	  while(1){
-		  char line[128];
-		  uint8_t gpsTest;
-
-		  if (gps_readoneline(line, sizeof(line), 3000))
-		  {
-		      gpsTest = 1;      // line contains a clean "$G....\r\n"
-		      // breakpoint: inspect line
-		  }
-		  else
-		  {
-		      gpsTest = 0;
-		  }
-
-		  if (HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin) == 1)
-		  {
-			  HAL_GPIO_WritePin((LED1_GPIO_Port), (LED1_Pin), GPIO_PIN_SET);
-		  }
-
-	 	  __NOP();
-	  }
-
-
-
 	  /* RF TEST--------------------------*/
 	  uint8_t reg_val = 0;
 	  bool ok = rf_read_register(0x08AC, &reg_val);
@@ -907,35 +1002,21 @@ void test_all(void){
 
 void pyro_test(void){
 
-	uint8_t cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-	PIN_HIGH(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
-	cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-	PIN_LOW(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
-	cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-	__NOP();
-
-	uint8_t cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
-	PIN_HIGH(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
-	cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
-	PIN_LOW(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
-	__NOP();
-
-	uint8_t cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
-	__NOP();
-
-	uint8_t cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
-	__NOP();
-
-	__NOP();
 	PIN_HIGH(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
-	PIN_LOW(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
 	__NOP();
+	PIN_HIGH(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+	PIN_HIGH(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+	PIN_HIGH(Pyro_CTRL_3_GPIO_Port, Pyro_CTRL_3_Pin);
+	PIN_HIGH(Pyro_CTRL_4_GPIO_Port, Pyro_CTRL_4_Pin);
 
-	cont1 = HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin);
-	cont2 = HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin);
-	cont3 = HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin);
-	cont4 = HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin);
-	__NOP();
+	HAL_Delay(1000);		//1 second delay = 1000
+
+	PIN_LOW(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
+	PIN_LOW(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+	PIN_LOW(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+	PIN_LOW(Pyro_CTRL_3_GPIO_Port, Pyro_CTRL_3_Pin);
+	PIN_LOW(Pyro_CTRL_4_GPIO_Port, Pyro_CTRL_4_Pin);
+
 
 	return;
 }
