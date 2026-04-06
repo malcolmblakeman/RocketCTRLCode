@@ -327,7 +327,10 @@ int main(void)
 //		         // pack
 //		     }
 //		 }
-
+			vel = g_ab.v;
+		  altitude = alt_meas_m;
+		  accel = s_lowG;
+		  
 		  //Flight state machine
 		  switch (g_flightState)
 		  	  {
