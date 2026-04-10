@@ -371,14 +371,42 @@ int main(void)
 		  		  break;
 
 		  		case FS_MAIN_DESCENT:
-		  			if (0)//altidude is AROUND ground level and accel is less than threshold
-		  			{
-		  				g_flightState = FS_LANDED;
-		  			}
-		  			break;
+{
+    float altitude_est = g_ab.x;   // filtered altitude
+    float velocity_est = g_ab.v;
+
+    // magnitude of acceleration vector (simple)
+    float accel_mag = sqrtf(
+        s_lowG[0]*s_lowG[0] +
+        s_lowG[1]*s_lowG[1] +
+        s_lowG[2]*s_lowG[2]
+    );
+
+    // Check landing conditions
+    if ((altitude_est < LAND_ALT_THRESH) &&
+        (fabsf(velocity_est) < LAND_VEL_THRESH) &&
+        (fabsf(accel_mag - 1.0f) < LAND_ACCEL_THRESH))
+    {
+        landed_counter++;
+
+        if (landed_counter >= LAND_COUNT_THRESH)
+        {
+            g_flightState = FS_LANDED;
+            landed_counter = 0;
+        }
+    }
+    else
+    {
+        landed_counter = 0; // reset if unstable
+    }
+}
+break;
 
 		  		case FS_LANDED:
-		  			//transmit the rest of the stored data
+		  			 tim3_set_period_counts(5000);  // much slower loop / telemetry
+
+				    // Optional: indicate landed (LED, buzzer, etc.)
+				    HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET);
 		  		default:
 		  			break;
 		  	  }
