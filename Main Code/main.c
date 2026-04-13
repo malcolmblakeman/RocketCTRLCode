@@ -327,7 +327,7 @@ int main(void)
 //		         // pack
 //		     }
 //		 }
-			vel = g_ab.v;
+			float vel = g_ab.v; //in m/s
 		  altitude = alt_meas_m;
 		  float accel = s_lowG * 0.122 * 9.8; //in m/s^2
 		  
