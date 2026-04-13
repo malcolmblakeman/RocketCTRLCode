@@ -329,7 +329,7 @@ int main(void)
 //		 }
 			vel = g_ab.v;
 		  altitude = alt_meas_m;
-		  accel = s_lowG;
+		  float accel = s_lowG * 0.122 * 9.8; //in m/s^2
 		  
 		  //Flight state machine
 		  switch (g_flightState)
