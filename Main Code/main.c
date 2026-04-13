@@ -13,10 +13,9 @@
   * in the root directory of this software component.
   * If no LICENSE file comes with this software, it is provided AS-IS.
   *TODO: Check GPS code once antenna is working
-  *TODO: Test pack buffer command
-  *TODO: Create page append commad to place tx buffer in a 256byte page buffer
-  *TODO: Make flash code for transmitting 256 bytes
+  *TODO: Test page append commad to place tx buffer in a 256byte page buffer
   *TODO: Make GPS RX with DMA
+  *TODO: Test baro fluctuation and AB filter
   ******************************************************************************
 **/
 
