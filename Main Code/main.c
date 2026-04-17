@@ -328,16 +328,26 @@ int main(void)
 //		 }
 			float vel = g_ab.v; //in m/s
 		  float altitude = alt_meas_m; //in m
-		  float accel = s_lowG * 0.122 * 9.8; //in m/s^2
+		  float accel = s_lowG[0] * 0.122 * 9.8; //in m/s^2
 		  
 		  //Flight state machine
 		  switch (g_flightState)
 		  	  {
 		  	  	  case FS_PAD:
-		  	  	  if (1)	//s_lowG[0] > 0
+					static int acc_launch = 0;
+		  	  	  if (accel > 20)	//s_lowG[0] > 0
 		  		  {
-		  			  g_flightState = FS_BOOST;
+		  			  acc_launch += 1;
 		  		  }
+				else
+				  {
+					acc_launch = 0;
+				  }
+					if(acc_launch > 3)
+					{
+						g_flightState = FS_BOOST;
+					}
+					  
 		  		  break;
 
 		  		case FS_BOOST:
