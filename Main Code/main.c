@@ -328,7 +328,7 @@ int main(void)
 //		 }
 			float vel = g_ab.v; //in m/s
 		  float altitude = alt_meas_m; //in m
-		  float accel = s_lowG[0] * 0.122 * 9.8; //in m/s^2
+		  float accel = s_lowG[0] * 0.488 * 9.8 * 1/1000; //in m/s^2
 		  
 		  //Flight state machine
 		  switch (g_flightState)
@@ -351,16 +351,36 @@ int main(void)
 		  		  break;
 
 		  		case FS_BOOST:
-		  		  if (0)//accel < burnout threshold for 3 cycles
+				static int acc_coast = 0;
+		  	  	  if (accel < -0.5)	//s_lowG[0] > 0
 		  		  {
-		  			  g_flightState = FS_COAST;
+		  			  acc_coast += 1;
+		  		  }
+				else
+				  {
+					acc_coast = 0;
+				  }
+					if(acc_launch > 3)
+					{
+						g_flightState = FS_COAST;
+					}
 		  		  }
 		  		  break;
 
 		  		case FS_COAST:
-		  		  if (0)//altitude > minimum apogee altitude AND velocity < negative threshold for 3 cycles
+		  		  static int move_apogee = 0;
+		  	  	  if (altitude > 3000 && vel < -100)	
 		  		  {
-		  			  g_flightState = FS_APOGEE;
+		  			  move_apogee += 1;
+		  		  }
+				else
+				  {
+					move_apogee = 0;
+				  }
+					if(move_apogee > 3)
+					{
+						g_flightState = FS_APOGEE;
+					}
 		  		  }
 		  		  break;
 
