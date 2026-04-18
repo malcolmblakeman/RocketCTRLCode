@@ -397,6 +397,20 @@ int main(void)
 		  				tim3_set_period_counts(999);
 		  				g_flightState = FS_MAIN_DESCENT;
 		  			}
+
+					static int alt_deploy = 0;
+		  	  	  if (altitude < 500)
+		  		  {
+		  			  alt_deploy += 1;
+		  		  }
+				else
+				  {
+					alt_deploy = 0;
+				  }
+					if(alt_deploy > 3)
+					{
+						g_flightState = FS_MAIN_DESCENT;
+					}
 		  		  break;
 
 		  		case FS_MAIN_DESCENT:
