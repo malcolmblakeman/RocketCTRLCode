@@ -369,7 +369,7 @@ int main(void)
 
 		  		case FS_COAST:
 		  		  static int move_apogee = 0;
-		  	  	  if (altitude > 3000 && vel < -100)	
+		  	  	  if (altitude > 2000 && vel < -100)	
 		  		  {
 		  			  move_apogee += 1;
 		  		  }
