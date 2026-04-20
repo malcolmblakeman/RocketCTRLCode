@@ -360,7 +360,7 @@ int main(void)
 				  {
 					acc_coast = 0;
 				  }
-					if(acc_launch > 3)
+					if(acc_coast > 3)
 					{
 						g_flightState = FS_COAST;
 					}
@@ -391,12 +391,6 @@ int main(void)
 		  		  break;
 
 		  		case FS_DROGUE_DESCENT:
-		  			if (0)//altidute < main deployment altitude
-		  			{
-		  				light_main_pyro();
-		  				tim3_set_period_counts(999);
-		  				g_flightState = FS_MAIN_DESCENT;
-		  			}
 
 					static int alt_deploy = 0;
 		  	  	  if (altitude < 500)
