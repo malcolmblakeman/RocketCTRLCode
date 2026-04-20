@@ -409,33 +409,26 @@ int main(void)
 
 		  		case FS_MAIN_DESCENT:
 {
-    float altitude_est = g_ab.x;   // filtered altitude
-    float velocity_est = g_ab.v;
-
     // magnitude of acceleration vector (simple)
     float accel_mag = sqrtf(
         s_lowG[0]*s_lowG[0] +
         s_lowG[1]*s_lowG[1] +
         s_lowG[2]*s_lowG[2]
     );
-
-    // Check landing conditions
-    if ((altitude_est < LAND_ALT_THRESH) &&
-        (fabsf(velocity_est) < LAND_VEL_THRESH) &&
-        (fabsf(accel_mag - 1.0f) < LAND_ACCEL_THRESH))
-    {
-        landed_counter++;
-
-        if (landed_counter >= LAND_COUNT_THRESH)
-        {
-            g_flightState = FS_LANDED;
-            landed_counter = 0;
-        }
-    }
-    else
-    {
-        landed_counter = 0; // reset if unstable
-    }
+	static int has_landed = 0;
+    if(accel_mag > 8)
+	{
+		has_landed += 1;
+	}
+	else
+	{
+		has_landed = 0;
+	}
+	if(has_landed > 3)
+	{
+		g_flightState = FS_LANDED;
+	}
+	
 }
 break;
 
