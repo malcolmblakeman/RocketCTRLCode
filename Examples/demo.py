@@ -132,6 +132,7 @@ def connect_serial():
 
 
 def ascii_positions_to_decimal(values, array_pos_1, array_pos_2):
+    #for indexs in transmissions 
     value_1 = values[array_pos_1]
     value_2 = values[array_pos_2]
 
