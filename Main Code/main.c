@@ -410,13 +410,12 @@ int main(void)
 		  		case FS_MAIN_DESCENT:
 {
     // magnitude of acceleration vector (simple)
-    float accel_mag = sqrtf(
+    float accel_mag = 
         s_lowG[0]*s_lowG[0] +
         s_lowG[1]*s_lowG[1] +
-        s_lowG[2]*s_lowG[2]
-    );
+        s_lowG[2]*s_lowG[2];
 	static int has_landed = 0;
-    if(accel_mag > 8)
+    if(accel_mag < 100)
 	{
 		has_landed += 1;
 	}
