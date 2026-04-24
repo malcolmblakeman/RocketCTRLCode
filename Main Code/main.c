@@ -53,49 +53,44 @@
 5 = DESCENT
 6 = MAIN_FIRED
 7 = LANDED / DONE */
-#define STATE          	0
-#define CONT          	1
+#define ID             0
+#define STATE          1
+#define CONT           2
 
-#define LAT_DEG         2
-#define LAT_MIN_LSB     3
-#define LAT_MIN_MSB     4
-#define LON_DEG         5
-#define LON_MIN_LSB     6
-#define LON_MIN_MSB     7
+#define VELO_LSB       3
+#define VELO_MSB       4
+#define ALT_LSB        5
+#define ALT_MSB        6
 
-#define VELO_LSB        8
-#define VELO_MSB        9
-#define ALT_LSB        10
-#define ALT_MSB        11
+#define LG_X_LSB       7
+#define LG_X_MSB       8
+#define LG_Y_LSB       9
+#define LG_Y_MSB       10
+#define LG_Z_LSB       11
+#define LG_Z_MSB       12
 
-#define LG_X_LSB       12
-#define LG_X_MSB       13
-#define LG_Y_LSB       14
-#define LG_Y_MSB       15
-#define LG_Z_LSB       16
-#define LG_Z_MSB       17
+#define HG_X_LSB       13
+#define HG_X_MSB       14
+#define HG_Y_LSB       15
+#define HG_Y_MSB       16
+#define HG_Z_LSB       17
+#define HG_Z_MSB       18
 
-#define HG_X_LSB       18
-#define HG_X_MSB       19
-#define HG_Y_LSB       20
-#define HG_Y_MSB       21
-#define HG_Z_LSB       22
-#define HG_Z_MSB       23
+#define GY_P_LSB       19
+#define GY_P_MSB       20
+#define GY_R_LSB       21
+#define GY_R_MSB       22
+#define GY_Y_LSB       23
+#define GY_Y_MSB       24
 
-#define GY_P_LSB       24
-#define GY_P_MSB       25
-#define GY_R_LSB       26
-#define GY_R_MSB       27
-#define GY_Y_LSB       28
-#define GY_Y_MSB       29
+#define T_STAMP_1      25
+#define T_STAMP_2      26
+#define T_STAMP_3      27
+#define T_STAMP_4      28
+#define T_STAMP_5      29
 
-#define T_STAMP_1      30
-#define T_STAMP_2      31
-#define T_STAMP_3      32
-#define T_STAMP_4      33
-
-#define FLAGS          34		//Bits 0-3 continuity checking, Bits 4-7 are rocket state
-#define CRC8		   35
+#define FLAGS          30
+#define CRC8           31
 
 #define PKT_LEN        36
 
