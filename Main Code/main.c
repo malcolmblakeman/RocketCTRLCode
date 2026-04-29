@@ -12,15 +12,17 @@
   * This software is licensed under terms that can be found in the LICENSE file
   * in the root directory of this software component.
   * If no LICENSE file comes with this software, it is provided AS-IS.
-  *TODO: Check GPS code once antenna is working
-  *TODO: Test page append commad to place tx buffer in a 256byte page buffer
-  *TODO: Make GPS RX with DMA
-  *TODO: Test baro fluctuation and AB filter
+
   ******************************************************************************
 **/
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "app_usbx_device.h"
+#include "ux_device_cdc_acm.h"
+#include "ux_device_class_cdc_acm.h"
+#include "ux_api.h"
+#include "usb.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -31,10 +33,14 @@
 #include "lps22hh.h"
 #include "lsm6dsv80x_reg.h"
 #include "sensor.h"
+#include <llcc68.h>
+#include <llcc68_hal.h>
 
 /* Private typedef -----------------------------------------------------------*/
 
 /* Private define ------------------------------------------------------------*/
+#define MAX_PENDING_SAMPLES 5
+
 #define SPI_READ_BIT   			(0x80)
 #define SPI_AUTO_INC   			(0x40)
 
@@ -43,6 +49,32 @@
 
 #define IMU_REG_WHO_AM_I    	(0x0F)
 #define IMU_WHO_AM_I_VAL  		(0x73)
+
+#define FLASH_DUMP_START_ADDR   0x000000UL
+#define FLASH_DUMP_TEST_SIZE    256U   // 4 KB first test
+#define FLASH_DUMP_FULL_SIZE    0x200000UL   // 2 MB full flash
+#define FLASH_DUMP_CHUNK_SIZE   256U
+
+//bit 0 = barometer initialization failed
+//bit 1 = barometer read failed
+//bit 2 = IMU initialization failed
+//bit 3 = IMU read failed
+//bit 4 = flash ring buffer overflowed
+//bit 5 = flash write/ring-buffer accept failed
+//bit 6 = RF initialization failed
+//bit 7 = RF transmit timeout/failure
+#define FAULT_NONE              0x00
+#define FAULT_BARO_INIT         (1u << 0)   // 0x01
+#define FAULT_BARO_READ         (1u << 1)   // 0x02
+#define FAULT_IMU_INIT          (1u << 2)   // 0x04
+#define FAULT_IMU_READ          (1u << 3)   // 0x08
+#define FAULT_FLASH_OVERFLOW    (1u << 4)   // 0x10
+#define FAULT_FLASH_WRITE       (1u << 5)   // 0x20
+#define FAULT_RF_INIT           (1u << 6)   // 0x40
+#define FAULT_RF_TIMEOUT        (1u << 7)   // 0x80
+
+#define ID_LSB         0
+#define ID_MSB         1
 
 //STATE (BIT enables)
 /* 0 = PAD
@@ -53,53 +85,55 @@
 5 = DESCENT
 6 = MAIN_FIRED
 7 = LANDED / DONE */
-#define ID             0
-#define STATE          1
-#define CONT           2
+#define STATE          2
+#define CONT           3
 
-#define VELO_LSB       3
-#define VELO_MSB       4
-#define ALT_LSB        5
-#define ALT_MSB        6
+#define VELO_LSB       4
+#define VELO_MSB       5
+#define ALT_LSB        6
+#define ALT_MSB        7
 
-#define LG_X_LSB       7
-#define LG_X_MSB       8
-#define LG_Y_LSB       9
-#define LG_Y_MSB       10
-#define LG_Z_LSB       11
-#define LG_Z_MSB       12
+#define LG_X_LSB       8
+#define LG_X_MSB       9
+#define LG_Y_LSB       10
+#define LG_Y_MSB       11
+#define LG_Z_LSB       12
+#define LG_Z_MSB       13
 
-#define HG_X_LSB       13
-#define HG_X_MSB       14
-#define HG_Y_LSB       15
-#define HG_Y_MSB       16
-#define HG_Z_LSB       17
-#define HG_Z_MSB       18
+#define HG_X_LSB       14
+#define HG_X_MSB       15
+#define HG_Y_LSB       16
+#define HG_Y_MSB       17
+#define HG_Z_LSB       18
+#define HG_Z_MSB       19
 
-#define GY_P_LSB       19
-#define GY_P_MSB       20
-#define GY_R_LSB       21
-#define GY_R_MSB       22
-#define GY_Y_LSB       23
-#define GY_Y_MSB       24
+#define GY_P_LSB       20
+#define GY_P_MSB       21
+#define GY_R_LSB       22
+#define GY_R_MSB       23
+#define GY_Y_LSB       24
+#define GY_Y_MSB       25
 
-#define T_STAMP_1      25
-#define T_STAMP_2      26
-#define T_STAMP_3      27
-#define T_STAMP_4      28
-#define T_STAMP_5      29
+#define T_STAMP_1      26
+#define T_STAMP_2      27
+#define T_STAMP_3      28
+#define T_STAMP_4      29
 
 #define FLAGS          30
 #define CRC8           31
 
-#define PKT_LEN        36
+#define PKT_LEN        32
 
 
 /* Private macro -------------------------------------------------------------*/
 #define PIN_LOW(port, pin)   		HAL_GPIO_WritePin((port), (pin), GPIO_PIN_RESET)
 #define PIN_HIGH(port, pin)  		HAL_GPIO_WritePin((port), (pin), GPIO_PIN_SET)
 
-#define GPS_FIX_READ()  	 		(HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin) == GPIO_PIN_SET)
+#define PYRO_MASTER_ENABLE()   HAL_GPIO_WritePin(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin, GPIO_PIN_SET)
+#define PYRO_MASTER_DISABLE()  HAL_GPIO_WritePin(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin, GPIO_PIN_RESET)
+
+#define SET_FAULT(fault)      do { g_faultFlags |= (fault); } while (0)
+#define CLEAR_FAULT(fault)    do { g_faultFlags &= (uint8_t)~(fault); } while (0)
 
 #define PAK_U16(buf, idx_lsb, v) do {              \
   (buf)[(idx_lsb)]     = (uint8_t)((v) & 0xFF);    \
@@ -121,17 +155,15 @@ SPI_HandleTypeDef hspi2;
 
 TIM_HandleTypeDef htim3;
 
-UART_HandleTypeDef huart2;
-
-PCD_HandleTypeDef hpcd_USB_DRD_FS;
+extern PCD_HandleTypeDef hpcd_USB_DRD_FS;
 
 extern LPS22HH_Object_t baro;
 
 typedef enum
 {
-    FS_PAD = 0,
+	FS_PAD = 0,
     FS_BOOST,
-    FS_COAST,
+    FS_BURNOUT,
     FS_APOGEE,
     FS_DROGUE_DESCENT,
     FS_MAIN_DESCENT,
@@ -146,29 +178,36 @@ typedef struct {
   uint8_t inited;
 } ABFilter;
 
+static ABFilter g_ab;
 static flight_state_t g_flightState = FS_PAD;
-
-//Test Variables
-static uint8_t  	rx_byte;
-static char     	nmea_line[128];
-static volatile 	uint16_t nmea_idx = 0;
-static volatile 	uint8_t  nmea_line_ready = 0;
 
 //Real Program Variables
 static volatile uint8_t 	g_pyroActive = 0;
-static volatile	uint8_t 	g_pyroTicks = 0;   		//Determines how long pyro channels on
-static volatile	uint8_t 	g_rfTicks = 0;			//Determines how long between every rf tx
 static volatile uint32_t 	g_timeStamp = 0;		//Keeps track of time in 100's of ms
 static volatile uint8_t 	g_LoRaTx = 0;			//Transmit to LoRa module
 static volatile uint16_t 	g_pendingSamples = 0;
+static volatile uint16_t 	g_missedSamples = 0;
+static volatile uint8_t 	g_faultFlags = FAULT_NONE;
+static uint8_t 				g_rfHealthy = 0;
 static volatile uint32_t 	flash_write_addr = 0;
 static uint8_t 				tx_buf[PKT_LEN] = {0};
 static uint8_t 				lora_buf[PKT_LEN];
-static 						ABFilter g_ab;
 static float 				g_p0_hpa = 0.0f;
 static uint8_t 				g_p0_set = 0;
+static volatile uint32_t 	g_pyroOffTime_ms = 0;
+static volatile uint32_t 	g_samplePeriod_ms = 10;
+static uint8_t 				g_flushPreflight = 0;
+static volatile uint8_t 	g_getData = 0;
+volatile uint32_t g_usb_irq_count = 0;
+volatile uint32_t g_main_alive_count = 0;
+volatile uint32_t g_usb_tasks_run_count = 0;
 
-
+volatile HAL_StatusTypeDef g_pcd_start_ret = HAL_ERROR;
+volatile uint32_t g_usb_irq_enabled = 0;
+volatile uint32_t g_usb_irq_pending = 0;
+volatile uint32_t g_pcd_state = 0;
+volatile uint32_t g_usb_bcdr_after_start = 0;
+volatile uint32_t g_usb_dppu_after_start = 0;
 
 
 
@@ -179,7 +218,6 @@ static void mx_gpio_init(void);
 static void mx_icache_init(void);
 static void mx_spi1_init(void);
 static void mx_spi2_init(void);
-static void mx_usart2_uart_init(void);
 static void mx_usb_pcd_init(void);
 static void mx_tim3_init(void);
 void tim3_set_period_counts(uint16_t arr);
@@ -188,10 +226,8 @@ void tim3_set_period_counts(uint16_t arr);
 void test_all(void);
 void pyro_test(void);
 void flash_read_id(uint8_t id[3]);
-void gps_grab_line(void);
 static bool barom_test(uint8_t *whoami_out);
 static bool imu_test(uint8_t *who_out);
-int gps_readoneline(char *out, int maxlen, uint32_t timeout_ms);
 bool rf_read_register(uint16_t addr, uint8_t* val_out);
 static bool llcc68_wait_while_busy(uint32_t timeout_ms);
 
@@ -200,17 +236,23 @@ static void light_apogee_pyro(void);
 static void light_main_pyro(void);
 static inline uint16_t float_to_u16(float x, float scale, float offset);
 static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
-                            uint8_t lat_deg, uint16_t lat_min,
-                            uint8_t lon_deg, uint16_t lon_min,
                             const int16_t lowG[3],
                             const int16_t highG[3],
                             const int16_t gyro[3],
-							float vel,
-							float alt,
-                            uint8_t flags);
+                            float vel,
+                            float alt,
+                            uint8_t state,
+                            uint8_t continuityFlags,
+                            uint8_t faultFlags);
 static inline void ab_init(ABFilter *f, float x0, float v0, float alpha, float beta);
 static inline void ab_update(ABFilter *f, float z_meas, float dt);
 static inline float pressure_to_alt(float p_hpa, float p0_hpa);
+static uint8_t check_continuity(void);
+static void pyro_all_off(void);
+static void usb_boot_dump_window(uint32_t window_ms);
+UINT usb_cdc_write_all(const uint8_t *data, ULONG len);
+
+extern UX_SLAVE_CLASS_CDC_ACM *cdc_acm_instance_ptr;
 
 /*-------------------------------------------------------------------------------*/
 
@@ -229,67 +271,101 @@ int main(void)
 
   /* Initialize all configured peripherals */
   mx_gpio_init();
-
   mx_spi1_init();
-  mx_spi2_init();					//Initialized in mode 3
-  mx_usart2_uart_init();
-  //mx_usb_pcd_init();
+  mx_spi2_init();
   mx_tim3_init();
-  gps_init();
 
-  test_all();						//Test sensors
-  pyro_test();
+  pyro_all_off();
+
+  flash_init();
+
+  flash_erase_entire_chip();
+
+  usb_init();
+  usb_dump(3000);		//30sec
+
+
 
   /* Initialize all sensors */
-  barom_init();
-  imu_init();
-  flash_init();
-  flash_sector_erase(0x000000);
-  //flash_erase_entire_chip();
-  flash_wait_busy();
+  if (barom_init() != 0)
+  {
+      SET_FAULT(FAULT_BARO_INIT);
+  }
+
+  if (imu_init() != 0)
+  {
+      SET_FAULT(FAULT_IMU_INIT);
+  }
+  if (RF_TX_Init() == true)
+  {
+      g_rfHealthy = 1;
+  }
+  else
+  {
+      g_rfHealthy = 0;
+      SET_FAULT(FAULT_RF_INIT);
+  }
+
+  flash_erase_entire_chip();
+
   ring_buf_init();
 
 
-
   /* Initialize variables, test, and start timer */
-  uint16_t pres_u16 = 0;
-
   int16_t s_lowG[3] = {0};
   int16_t s_highG[3] = {0};
   int16_t s_gyro[3] = {0};
 
   float p_hpa = 0;
 
-  char gga[128];
-  uint8_t  latD = 0xFF, lonD = 0xFF;      // Latitude and longitude degrees
-  uint16_t latM = 0xFFFF, lonM = 0xFFFF;  // Latitude and longitude minutes
-
   g_p0_set = 0;
   g_ab.inited = 0;
 
-  HAL_TIM_Base_Start_IT(&htim3);	//start timer interrupt at 10ms
+  static uint8_t drogueTimerSlowed = 0;
+  static uint8_t mainTimerSlowed = 0;
 
+  HAL_TIM_Base_Start_IT(&htim3);	//start timer interrupt at 10ms
 
   /* START FLIGHT LOOP */
   while (1)
   {
-	  if(g_pendingSamples > 0)
+	  if(g_getData)
 	  {
-		  g_pendingSamples--;
+		  g_getData = 0;
 
 		  //Read Barom
 		  if (barom_read(&p_hpa) == 0)
 		  {
 		    // AB filter update
-			const float dt = 0.01f;
+			  static uint32_t lastSample_ms = 0;
+
+			  uint32_t now_ms = HAL_GetTick();
+
+			  float dt;
+			  if (lastSample_ms == 0)
+			  {
+			      dt = 0.01f;
+			  }
+			  else
+			  {
+			      dt = (now_ms - lastSample_ms) / 1000.0f;
+			  }
+
+			  lastSample_ms = now_ms;
+
+			  if (dt < 0.001f) dt = 0.001f;
+			  if (dt > 0.250f) dt = 0.250f;   // prevents one long block from exploding velocity
+
+			__NOP();
 
 		    // latch ground/reference pressure once
-		    if (!g_p0_set) {
+		    if (!g_p0_set)
+		    {
 		      g_p0_hpa = p_hpa;
 		      g_p0_set = 1;
 
 		      // good starting gains for 10ms
-		      ab_init(&g_ab, 0.0f, 0.0f, 0.20f, 0.05f);
+		      ab_init(&g_ab, 0.0f, 0.0f, 0.06f, 0.001f);
 		    }
 
 		    // convert pressure -> altitude measurement (meters relative to p0)
@@ -297,171 +373,244 @@ int main(void)
 
 		    // update filter
 		    ab_update(&g_ab, alt_meas_m, dt);
+
+		    __NOP();
+		  }
+		  else
+		  {
+			  SET_FAULT(FAULT_BARO_READ);
 		  }
 
 
 		  //Read IMU
-		  if (imu_read(s_lowG, s_highG, s_gyro) == 0)
+		  if (imu_read(s_lowG, s_highG, s_gyro) != 0)
 		  {
 			  // lowG ~ (0,0, +something) when sitting still
 			  // gyro ~ (0,0,0) when not rotating
 			  // highG ~ (0,0,0) unless you smack it / vibrate it
+			  SET_FAULT(FAULT_IMU_READ);
+		  }
+		  __NOP();
+
+		  static uint8_t g_lastContinuityFlags = 0;
+
+		  uint8_t continuityFlags = g_lastContinuityFlags;
+
+		  if (!g_pyroActive)
+		  {
+		      continuityFlags = check_continuity();
+		      g_lastContinuityFlags = continuityFlags;
 		  }
 
 
-		 //TODO: add a "gps_service" function that lets us know every time a new gps line has been parsed. We will only get new gps data every ~100ms
-//		 if (gps_get_data(gga, sizeof(gga), 3000))
-//		 {
-//		     // gga now has some NMEA line
-//		 }
-//		 if (!strncmp(gga, "$GNGGA,", 7) || !strncmp(gga, "$GPGGA,", 7))
-//		 {
-//		     if (gps_gga(gga, &latD, &latM, &lonD, &lonM))
-//		     {
-//		         // pack
-//		     }
-//		 }
-			float vel = g_ab.v; //in m/s
-		  float altitude = alt_meas_m; //in m
-		  float accel = s_lowG[0] * 0.488 * 9.8 * 1/1000; //in m/s^2
-		  
 		  //Flight state machine
-		  switch (g_flightState)
-		  	  {
-		  	  	  case FS_PAD:
-					static int acc_launch = 0;
-		  	  	  if (accel > 20)	//s_lowG[0] > 0
-		  		  {
-		  			  acc_launch += 1;
-		  		  }
-				else
-				  {
-					acc_launch = 0;
-				  }
-					if(acc_launch > 3)
-					{
-						g_flightState = FS_BOOST;
-					}
-					  
-		  		  break;
+		 switch (g_flightState)
+		 {
+		 	 case FS_PAD:
+		 		static int acc_launch = 0;
+		 		if (s_lowG[0] > 3000)	//s_lowG[0] > 0
+		 		{
+		 			acc_launch += 1;
+		 		}
+		 		else
+		 		{
+		 			acc_launch = 0;
+		 		}
+		 		if(acc_launch >= 2)
+		 		{
+		 		    preflight_flush_start();
+		 		    g_flushPreflight = 1;
 
-		  		case FS_BOOST:
-				static int acc_coast = 0;
-		  	  	  if (accel < -0.5)	//s_lowG[0] > 0
-		  		  {
-		  			  acc_coast += 1;
-		  		  }
-				else
-				  {
-					acc_coast = 0;
-				  }
-					if(acc_coast > 3)
-					{
-						g_flightState = FS_COAST;
-					}
-		  		  }
-		  		  break;
+		 		    g_flightState = FS_BOOST;
+		 		}
 
-		  		case FS_COAST:
-		  		  static int move_apogee = 0;
-		  	  	  if (altitude > 2000 && vel < -100)	
-		  		  {
-		  			  move_apogee += 1;
-		  		  }
-				else
-				  {
-					move_apogee = 0;
-				  }
-					if(move_apogee > 3)
-					{
-						g_flightState = FS_APOGEE;
-					}
-		  		  }
-		  		  break;
+		 		break;
 
-		  		case FS_APOGEE:
-		  		  light_apogee_pyro();
-		  		  tim3_set_period_counts(99);
-		  		  g_flightState = FS_DROGUE_DESCENT;
-		  		  break;
+		 	 case FS_BOOST:
+		 		 HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+		 		 HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET);
+		 		 static int acc_coast = 0;
+		 		 if(s_lowG[0] < -1)
+		 		 {
+		 			 acc_coast += 1;
+		 		 }
+		 		 else
+		 		 {
+		 			 acc_coast = 0;
+		 		 }
+		 		 if(acc_coast >= 10)
+		 		 {
+		 			 g_flightState = FS_BURNOUT;
+		 		 }
+		 		 break;
 
-		  		case FS_DROGUE_DESCENT:
+		 	 case FS_BURNOUT:
+		 		 static int velo_apogee = 0;
+		 		 if(g_ab.v < 0 && g_ab.x > 30)
+		 		 {
+		 			 velo_apogee += 1;
+		 		 }
+		 		 else
+		 		 {
+		 			 velo_apogee = 0;
+		 		 }
+		 		 if(velo_apogee >= 10)
+		 		 {
+		 			 g_flightState = FS_APOGEE;
+		 		 }
+		 		 break;
 
-					static int alt_deploy = 0;
-		  	  	  if (altitude < 500)
-		  		  {
-		  			  alt_deploy += 1;
-		  		  }
-				else
-				  {
-					alt_deploy = 0;
-				  }
-					if(alt_deploy > 3)
-					{
-						g_flightState = FS_MAIN_DESCENT;
-					}
-		  		  break;
+		 	 case FS_APOGEE:
+		 		 light_apogee_pyro();
+		  		 g_flightState = FS_DROGUE_DESCENT;
+		  		 break;
 
-		  		case FS_MAIN_DESCENT:
-{
-    // magnitude of acceleration vector (simple)
-    float accel_mag = 
-        s_lowG[0]*s_lowG[0] +
-        s_lowG[1]*s_lowG[1] +
-        s_lowG[2]*s_lowG[2];
-	static int has_landed = 0;
-    if(accel_mag < 100)
-	{
-		has_landed += 1;
-	}
-	else
-	{
-		has_landed = 0;
-	}
-	if(has_landed > 3)
-	{
-		g_flightState = FS_LANDED;
-	}
-	
-}
-break;
+		 	 case FS_DROGUE_DESCENT:
+		 		 if(!g_pyroActive && !drogueTimerSlowed)
+		 		 {
+		 			tim3_set_period_counts(99);	//slow down data transmission to 10hz
+		 			drogueTimerSlowed = 1;
+		 		 }
 
-		  		case FS_LANDED:
-		  			 tim3_set_period_counts(5000);  // much slower loop / telemetry
+		 		 static int main_deploy = 0;
+		 		 if (!g_pyroActive && g_ab.x < 152)//deploy at 500 ft or 152 meters
+		 		 {
+		 			 main_deploy += 1;
+		 		 }
+		 		 else
+		 		 {
+		 			 main_deploy = 0;
+		 		 }
+		 		 if(main_deploy >= 2)
+		 		 {
+		 			 light_main_pyro();
+		 			 g_flightState = FS_MAIN_DESCENT;
+		 		 }
+		 		 break;
 
-				    // Optional: indicate landed (LED, buzzer, etc.)
-				    HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET);
-		  		default:
-		  			break;
-		  	  }
+		 	 case FS_MAIN_DESCENT:
+		 		 if(!g_pyroActive && !mainTimerSlowed)
+		 		 {
+		 			tim3_set_period_counts(999);	//slow down data transmission to 10hz
+		 			mainTimerSlowed = 1;
+		 		 }
 
-		  //Create buffer to be sent
-		  if (g_flightState != FS_PAD)
-		  {
-			  pack_buf(tx_buf, latD, latM, lonD, lonM, s_lowG, s_highG, s_gyro, g_ab.v, g_ab.x, (uint8_t)g_flightState);
-		      write_ring_buf(tx_buf, PKT_LEN);
-		  }
-		  if (flash_ring_overflowed())
-		  {
-			  HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET);
-		  }
+		 		 static int velo_landed = 0;
+		 		 if (g_ab.v > -1 && g_ab.v < 1  && g_ab.x < 8)//altidude is AROUND ground level (25 feet or 8 meters) and accel is less than threshold
+		 		 {
+		 			 velo_landed += 1;
+		 		 }
+		 		 else
+		 		 {
+		 			 velo_landed = 0;
+		 		 }
+		 		 if(velo_landed > 3)
+		 		 {
+		 			 g_flightState = FS_LANDED;
+		 		 }
+		 		 break;
 
-		  if((g_flightState != FS_PAD) && g_LoRaTx)
-		  {
-			  //TODO: Function for transmitting data over LoRa
-			  //Transmit latest data packet over LoRa
-			  memcpy(lora_buf, tx_buf, PKT_LEN);
-			  g_LoRaTx = 0;
-		  }
+		 	 case FS_LANDED:
+		 		HAL_TIM_Base_Stop_IT(&htim3);
+		 		pyro_all_off();
+		 		// After FS_LANDED:
+		 		flash_flush_partial_page();
 
-		  memset(tx_buf, 0xFF, PKT_LEN);
+		 		while (flash_has_pending_pages())
+		 		{
+		 		    service_ring();
+		 		}
+
+		 		preflight_buf_flush_to_flash(&flash_write_addr);
+
+		 		while(1){
+		 	        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+		 	        HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+		 	        HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET);
+		 	        HAL_GPIO_WritePin(LED4_GPIO_Port, LED4_Pin, GPIO_PIN_SET);
+
+		 	        HAL_Delay(200);
+
+		 	        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+		 	        HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+		 	        HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET);
+		 	        HAL_GPIO_WritePin(LED4_GPIO_Port, LED4_Pin, GPIO_PIN_RESET);
+
+		 	        HAL_Delay(200);
+		 		}
+		 		break;
+
+
+
+		 	 default:
+		 		 break;
+		 }
+
+		 //Create buffer to be sent
+		 pack_buf(tx_buf,
+		          s_lowG,
+		          s_highG,
+		          s_gyro,
+		          g_ab.v,
+		          g_ab.x,
+		          (uint8_t)g_flightState,
+		          continuityFlags,
+		          g_faultFlags);
+
+
+		 if (g_flightState == FS_PAD)
+		 {
+		     preflight_buf_append(tx_buf);
+		 }
+		 else
+		 {
+			 if (write_ring_buf(tx_buf, PKT_LEN) == 0)
+			 {
+			     SET_FAULT(FAULT_FLASH_WRITE);
+			 }
+			 if (flash_ring_overflowed())
+			 {
+			     SET_FAULT(FAULT_FLASH_OVERFLOW);
+			     HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_SET);
+			 }
+			 if (g_flushPreflight)
+			 {
+			     preflight_flush_service(1);
+
+			     if (preflight_flush_done())
+			     {
+			         g_flushPreflight = 0;
+			     }
+			  }
+		 }
+
+		 if (g_LoRaTx && g_flightState != FS_BOOST && g_flightState != FS_BURNOUT)
+		 {
+		     memcpy(lora_buf, tx_buf, PKT_LEN);
+
+		     if (g_rfHealthy)
+		     {
+		         if (RF_TX_send(lora_buf, PKT_LEN, 1000) == false)
+		         {
+		             SET_FAULT(FAULT_RF_TIMEOUT);
+		             g_rfHealthy = 0;   // optional: stop trying RF after failure
+		         }
+		     }
+		     else
+		     {
+		         SET_FAULT(FAULT_RF_INIT);
+		     }
+
+		     g_LoRaTx = 0;
+		 }
+		 //memset(tx_buf, 0xFF, PKT_LEN);
 	  }
 
-	  //gps_service();
-	  //LoRa_Service();
-	  service_ring();
+	  if(g_flightState != FS_PAD)
+	  {
+		  service_ring();
+	  }
   }
-
 }
 
 
@@ -474,20 +623,20 @@ break;
 
 static void light_apogee_pyro(void)
 {
-  // Set PC6 and 7 HIGH
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_SET);
+    PYRO_MASTER_ENABLE();
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
 
-  g_pyroActive = 1;
-  g_pyroTicks = 0;
+    g_pyroActive = 1;
+    g_pyroOffTime_ms = HAL_GetTick() + 500;
 }
 
 static void light_main_pyro(void)
 {
-  // Set PC8 and 9 HIGH
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
+    PYRO_MASTER_ENABLE();
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
 
-  g_pyroActive = 1;
-  g_pyroTicks = 0;
+    g_pyroActive = 1;
+    g_pyroOffTime_ms = HAL_GetTick() + 500;
 }
 
 // Converts value to uint16 using: round(value * scale) + offset
@@ -503,39 +652,53 @@ static inline uint16_t float_to_u16(float value, float scale, float offset)
   return (uint16_t)u16_value;
 }
 
+static uint8_t check_continuity(void)
+{
+    uint8_t pyroCont = 0;
+
+    if (HAL_GPIO_ReadPin(Pyro_CONT_1_GPIO_Port, Pyro_CONT_1_Pin) == GPIO_PIN_SET)
+    	pyroCont |= (1U << 0);
+
+    if (HAL_GPIO_ReadPin(Pyro_CONT_2_GPIO_Port, Pyro_CONT_2_Pin) == GPIO_PIN_SET)
+    	pyroCont |= (1U << 1);
+
+    if (HAL_GPIO_ReadPin(Pyro_CONT_3_GPIO_Port, Pyro_CONT_3_Pin) == GPIO_PIN_SET)
+    	pyroCont |= (1U << 2);
+
+    if (HAL_GPIO_ReadPin(Pyro_CONT_4_GPIO_Port, Pyro_CONT_4_Pin) == GPIO_PIN_SET)
+    	pyroCont |= (1U << 3);
+
+    return pyroCont;
+}
+
 static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
-                            uint8_t lat_deg, uint16_t lat_min,
-                            uint8_t lon_deg, uint16_t lon_min,
                             const int16_t lowG[3],
                             const int16_t highG[3],
                             const int16_t gyro[3],
-							float vel,
-							float alt,
-                            uint8_t flags)
+                            float vel,
+                            float alt,
+                            uint8_t state,
+                            uint8_t continuityFlags,
+                            uint8_t faultFlags)
 {
     // while debugging: start from a known state
 	memset(tx_buf, 0, PKT_LEN);
 
-	// ID
-	tx_buf[STATE] = (uint8_t)g_flightState;;
-	tx_buf[CONT] = 0xBB;
+    // ID
+    tx_buf[ID_LSB] = 0xDC;
+    tx_buf[ID_MSB] = 0xAC;
 
-	// GPS degrees/minutes
-	tx_buf[LAT_DEG] = lat_deg;
-	PAK_U16(tx_buf, LAT_MIN_LSB, lat_min);
+	tx_buf[STATE] = state;
+	tx_buf[CONT] = continuityFlags & 0x0F;
+	tx_buf[FLAGS] = faultFlags;
 
-	tx_buf[LON_DEG] = lon_deg;
-	PAK_U16(tx_buf, LON_MIN_LSB, lon_min);
 
 	// Altitude / Velocity
-	int16_t vel_cms = (int16_t)lroundf(vel * 100.0f);  // m/s -> cm/s
-	int16_t alt_cm  = (int16_t)lroundf(alt * 100.0f);  // m -> cm
+    int16_t vel_dms = (int16_t)lroundf(vel * 10.0f); // m/s -> decimeters/sec
+    uint16_t alt_dm = (uint16_t)lroundf(alt * 10.0f);// meters -> decimeters
 
-	uint16_t vel_u16 = (uint16_t)vel_cms; // preserve bits
-	uint16_t alt_u16 = (uint16_t)alt_cm;
-
-	PAK_U16(tx_buf, VELO_LSB, vel_u16);
-	PAK_U16(tx_buf, ALT_LSB, alt_u16);
+    PAK_U16(tx_buf, VELO_LSB, (uint16_t)vel_dms);
+    PAK_U16(tx_buf, ALT_LSB,  (uint16_t)alt_dm);
 
 	// IMU vectors (STM32 is little-endian; memcpy is fine and fast)
 	memcpy(&tx_buf[LG_X_LSB], lowG,  3 * sizeof(int16_t));   // X/Y/Z
@@ -545,11 +708,9 @@ static inline void pack_buf(uint8_t tx_buf[PKT_LEN],
 	// Timestamp (4 bytes)
 	PAK_U32(tx_buf, T_STAMP_1, g_timeStamp);
 
-	// CONT
-	tx_buf[FLAGS] = flags;
-
 	// CRC placeholder
-	tx_buf[CRC8] = 0xFF;
+	//tx_buf[CRC8] = crc8(tx_buf, CRC8);
+	tx_buf[CRC8] = 0xAA;
 }
 
 
@@ -581,6 +742,70 @@ static inline float pressure_to_alt(float p_hpa, float p0_hpa)
   return 44330.0f * (1.0f - powf(p_hpa / p0_hpa, 0.190294957f));
 }
 
+static void pyro_all_off(void)
+{
+    HAL_GPIO_WritePin(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Pyro_CTRL_3_GPIO_Port, Pyro_CTRL_3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Pyro_CTRL_4_GPIO_Port, Pyro_CTRL_4_Pin, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin, GPIO_PIN_RESET);
+
+    g_pyroActive = 0;
+}
+
+static void usb_boot_dump_window(uint32_t window_ms)
+{
+    (void)window_ms;
+
+    while (1)
+    {
+        usb_cdc_poll_rx();
+
+        if (usb_dump_command_received())
+        {
+            dump_entire_flash_over_usb();
+        }
+    }
+}
+
+
+UINT usb_cdc_write_all(const uint8_t *data, ULONG len)
+{
+    UINT status;
+    ULONG actual_length = 0;
+    uint32_t start_tick;
+
+    if (cdc_acm_instance_ptr == UX_NULL)
+    {
+        return UX_ERROR;
+    }
+
+    start_tick = HAL_GetTick();
+
+    while (1)
+    {
+        _ux_system_tasks_run();
+
+        status = ux_device_class_cdc_acm_write_run(cdc_acm_instance_ptr,
+                                                   (UCHAR *)data,
+                                                   len,
+                                                   &actual_length);
+
+        if ((status == UX_SUCCESS) || (status == UX_STATE_NEXT))
+        {
+            return UX_SUCCESS;
+        }
+
+        if ((HAL_GetTick() - start_tick) > 5000U)
+        {
+            return status;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
 /*-------------------------------------------------------------------------------*/
 
 
@@ -591,30 +816,30 @@ static inline float pressure_to_alt(float p_hpa, float p0_hpa)
 /* 100ms Delay Logic */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-	g_pendingSamples++;
-	g_timeStamp++;		//Keeps track of time in 100's of ms
+    if (htim->Instance != TIM3)
+    {
+        return;
+    }
 
-	/* Pyro channel control logic */
-	if (g_pyroActive)
-	{
-		g_pyroTicks++;
+    g_getData = 1;
 
-		if (g_pyroTicks >= 50) // 50 * 10ms = 0.5s
-		{
-			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_RESET);
-			g_pyroActive = 0;
-			g_pyroTicks = 0;
-		}
-	}
+    g_timeStamp += g_samplePeriod_ms;   // timestamp in milliseconds
 
-	/* RF transmission logic */
-	g_rfTicks++;
-	if (g_rfTicks >= 50){
-		g_LoRaTx = 1;
-		g_rfTicks = 0;
-	}
-	//Toggle LED1 for testing
-	HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);	//Probe and test with scope if actually 10ms
+    if (g_pyroActive && ((int32_t)(HAL_GetTick() - g_pyroOffTime_ms) >= 0))
+    {
+        pyro_all_off();
+    }
+
+    static uint32_t rfElapsed_ms = 0;
+    rfElapsed_ms += g_samplePeriod_ms;
+
+    if (rfElapsed_ms >= 500)
+    {
+        //g_LoRaTx = 1;
+        rfElapsed_ms = 0;
+    }
+
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
 }
 
 
@@ -671,8 +896,32 @@ void systemclock_config(void)
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
-    Error_Handler();
+      Error_Handler();
   }
+
+  /* Configure USB peripheral clock source */
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
+  PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
+
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+//  __HAL_RCC_CRS_CLK_ENABLE();
+//
+//  RCC_CRSInitTypeDef RCC_CRSInitStruct = {0};
+//
+//  RCC_CRSInitStruct.Prescaler = RCC_CRS_SYNC_DIV1;
+//  RCC_CRSInitStruct.Source = RCC_CRS_SYNC_SOURCE_USB;
+//  RCC_CRSInitStruct.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+//  RCC_CRSInitStruct.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000, 1000);
+//  RCC_CRSInitStruct.ErrorLimitValue = 34;
+//  RCC_CRSInitStruct.HSI48CalibrationValue = 32;
+//
+//  HAL_RCCEx_CRSConfig(&RCC_CRSInitStruct);
 
   /* Configure the programming delay */
   __HAL_FLASH_SET_PROGRAM_DELAY(FLASH_PROGRAMMING_DELAY_0);
@@ -759,24 +1008,26 @@ static void mx_spi2_init(void)
 /* Configure Timer for Interrupts to Transmit and Save Data */
 static void mx_tim3_init(void)
 {
-	TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-	TIM_MasterConfigTypeDef sMasterConfig = {0};
+    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-	htim3.Instance = TIM3;
-	htim3.Init.Prescaler = 31999;                 // 32MHz/32000 = 1kHz (1ms tick)
-	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim3.Init.Period = 9;                       // 100ms
-	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    htim3.Instance = TIM3;
+    htim3.Init.Prescaler = 31999;
+    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim3.Init.Period = 9;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
-	if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
+    if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
 
-	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-	if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK) Error_Handler();
+    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+    if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK) Error_Handler();
 
-	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) Error_Handler();
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) Error_Handler();
+
+    g_samplePeriod_ms = 10;
 }
 
 void tim3_set_period_counts(uint16_t arr)
@@ -788,62 +1039,11 @@ void tim3_set_period_counts(uint16_t arr)
     __HAL_TIM_SET_COUNTER(&htim3, 0);
     __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
 
+    g_samplePeriod_ms = (uint32_t)arr + 1U;
+
     HAL_TIM_Base_Start_IT(&htim3);
 }
 
-
-/* Configure USART2 for GPS */
-static void mx_usart2_uart_init(void)
-{
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 9600;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-
-/* Configure USB for Debugging in Field and Data Transfering */
-static void mx_usb_pcd_init(void)
-{
-  hpcd_USB_DRD_FS.Instance = USB_DRD_FS;
-  hpcd_USB_DRD_FS.Init.dev_endpoints = 8;
-  hpcd_USB_DRD_FS.Init.speed = USBD_FS_SPEED;
-  hpcd_USB_DRD_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
-  hpcd_USB_DRD_FS.Init.Sof_enable = DISABLE;
-  hpcd_USB_DRD_FS.Init.low_power_enable = DISABLE;
-  hpcd_USB_DRD_FS.Init.lpm_enable = DISABLE;
-  hpcd_USB_DRD_FS.Init.battery_charging_enable = DISABLE;
-  hpcd_USB_DRD_FS.Init.vbus_sensing_enable = DISABLE;
-  hpcd_USB_DRD_FS.Init.bulk_doublebuffer_enable = DISABLE;
-  hpcd_USB_DRD_FS.Init.iso_singlebuffer_enable = DISABLE;
-  if (HAL_PCD_Init(&hpcd_USB_DRD_FS) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
 /* GPIO Configurations */
 static void mx_gpio_init(void)
 {
@@ -861,7 +1061,7 @@ static void mx_gpio_init(void)
   HAL_GPIO_WritePin(GPIOC, SPI1_CS_RF_Pin|SPI2_CS_Flash_Pin|SPI1_CS_BAROM_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, RSFW_V2_Pin|Pyro_CTRL_Master_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, RFSW_V2_Pin|Pyro_CTRL_Master_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LED4_Pin|LED3_Pin|LED2_Pin|LED1_Pin, GPIO_PIN_RESET);
@@ -889,23 +1089,23 @@ static void mx_gpio_init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BAROM_INT_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : RSFW_V2_Pin Pyro_CTRL_Master_Pin */
-  GPIO_InitStruct.Pin = RSFW_V2_Pin;
+  /*Configure GPIO pins : RFSW_V2_Pin Pyro_CTRL_Master_Pin */
+  GPIO_InitStruct.Pin = RFSW_V2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : RSFW_V1_Pin */
-  GPIO_InitStruct.Pin = RSFW_V1_Pin;
+  /*Configure GPIO pin : RFSW_V1_Pin */
+  GPIO_InitStruct.Pin = RFSW_V1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(RSFW_V1_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(RFSW_V1_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : GPS_FIX_Pin */
   GPIO_InitStruct.Pin = GPS_FIX_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPS_FIX_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : LED4_Pin LED3_Pin LED2_Pin LED1_Pin */
@@ -941,6 +1141,12 @@ static void mx_gpio_init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Float_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : Pyro_CTRL_Master_Pin */
   GPIO_InitStruct.Pin = Pyro_CTRL_Master_Pin;
@@ -985,34 +1191,6 @@ static void mx_gpio_init(void)
 ///////////////////////////////////
 
 void test_all(void){
-
-
-	/* GPS TEST-------------------------------*/
-	 while(1){
-		 char line[128];
-		 uint8_t gpsTest;
-
-		 if (gps_readoneline(line, sizeof(line), 3000))
-		 {
-			 gpsTest = 1;      // line contains a clean "$G....\r\n"
-			 // breakpoint: inspect line
-		 }
-		 else
-		 {
-			 gpsTest = 0;
-		 }
-
-		 if (HAL_GPIO_ReadPin(GPS_FIX_GPIO_Port, GPS_FIX_Pin) == 1)
-		 {
-			 HAL_GPIO_WritePin((LED1_GPIO_Port), (LED1_Pin), GPIO_PIN_SET);
-			 HAL_GPIO_WritePin((LED2_GPIO_Port), (LED2_Pin), GPIO_PIN_SET);
-			 HAL_GPIO_WritePin((LED3_GPIO_Port), (LED3_Pin), GPIO_PIN_SET);
-			 HAL_GPIO_WritePin((LED4_GPIO_Port), (LED4_Pin), GPIO_PIN_SET);
-		 }
-
-		 __NOP();
-	 }
-
 	  /* FLASH TEST--------------------------*/
 	  uint8_t id[3] = {0};
 	  flash_read_id(id);			//Function for reading ID for flash chip
@@ -1056,22 +1234,26 @@ void test_all(void){
 }
 
 void pyro_test(void){
+	while(1)
+	{
+		PIN_HIGH(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
+		__NOP();
+		PIN_HIGH(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+		//PIN_HIGH(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+		//PIN_HIGH(Pyro_CTRL_3_GPIO_Port, Pyro_CTRL_3_Pin);
+		//PIN_HIGH(Pyro_CTRL_4_GPIO_Port, Pyro_CTRL_4_Pin);
 
-	PIN_HIGH(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
-	__NOP();
-	PIN_HIGH(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
-	PIN_HIGH(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
-	PIN_HIGH(Pyro_CTRL_3_GPIO_Port, Pyro_CTRL_3_Pin);
-	PIN_HIGH(Pyro_CTRL_4_GPIO_Port, Pyro_CTRL_4_Pin);
+		HAL_Delay(10);		//1 second delay = 1000
 
-	HAL_Delay(1000);		//1 second delay = 1000
+		PIN_LOW(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
+		PIN_LOW(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
+		//PIN_LOW(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
+		//PIN_LOW(Pyro_CTRL_3_GPIO_Port, Pyro_CTRL_3_Pin);
+		//PIN_LOW(Pyro_CTRL_4_GPIO_Port, Pyro_CTRL_4_Pin);
 
-	PIN_LOW(Pyro_CTRL_Master_GPIO_Port, Pyro_CTRL_Master_Pin);
-	PIN_LOW(Pyro_CTRL_1_GPIO_Port, Pyro_CTRL_1_Pin);
-	PIN_LOW(Pyro_CTRL_2_GPIO_Port, Pyro_CTRL_2_Pin);
-	PIN_LOW(Pyro_CTRL_3_GPIO_Port, Pyro_CTRL_3_Pin);
-	PIN_LOW(Pyro_CTRL_4_GPIO_Port, Pyro_CTRL_4_Pin);
-
+		HAL_Delay(3000);
+		__NOP();
+	}
 
 	return;
 }
@@ -1140,47 +1322,6 @@ static bool imu_test(uint8_t *who_out)
   if (who_out) *who_out = who;
 
   return (st == HAL_OK) && (who == IMU_WHO_AM_I_VAL);
-}
-
-
-int gps_readoneline(char *out, int maxlen, uint32_t timeout_ms)
-{
-    uint8_t c;
-    int idx = 0;
-    uint32_t t0 = HAL_GetTick();
-
-    if (maxlen <= 0) return 0;
-    memset(out, 0, maxlen);
-
-    while ((HAL_GetTick() - t0) < timeout_ms)
-    {
-        if (HAL_UART_Receive(&huart2, &c, 1, 10) == HAL_OK)
-        {
-            if (c == '$')
-            {
-                // hard resync: start a new sentence right here
-                idx = 0;
-                out[idx++] = '$';
-                continue;
-            }
-
-            // ignore everything until we've seen a '$'
-            if (idx == 0) continue;
-
-            if (idx < (maxlen - 1))
-                out[idx++] = (char)c;
-            else
-                idx = 0; // overflow -> resync
-
-            if (c == '\n')
-            {
-                out[idx] = '\0';
-                return 1;
-            }
-        }
-    }
-    out[0] = '\0';
-    return 0;
 }
 
 
