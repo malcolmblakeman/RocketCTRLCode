@@ -13,29 +13,57 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include "ux_api.h"
+#include "app_usbx_device.h"
+#include "ux_device_cdc_acm.h"
+#include "ux_device_class_cdc_acm.h"
+#include "ux_api.h"
+#include "usb.h"
 
 extern SPI_HandleTypeDef hspi1;
 extern SPI_HandleTypeDef hspi2;
 static LPS22HH_Object_t baro;
 static stmdev_ctx_t imu_ctx;
-extern UART_HandleTypeDef huart2;
 
 #define SPI_READ_BIT   (0x80)
 #define SPI_AUTO_INC   (0x40)
 
 //Page defines
 #define PAGE_SIZE      256
-#define PKTS_PER_PAGE  7
-#define PAGE_DATA_LEN  (PKT_LEN * PKTS_PER_PAGE)  // 252
+#define PKTS_PER_PAGE  8
+#define PAGE_DATA_LEN  PAGE_SIZE  // 252
 
-
-// Footer indices:
-#define PAGE_SEQ_LSB   252
-#define PAGE_SEQ_MSB   253
-#define PAGE_CRC_LSB   254
-#define PAGE_CRC_MSB   255
+#define PRE_FLIGHT_BUF_SIZE   1536
+#define PRE_FLIGHT_MAX_PKTS   (PRE_FLIGHT_BUF_SIZE / PKT_LEN)
 
 #define FLASH_TOTAL_SIZE   0x200000UL   // 2 MBytes
+#define FLASH_RING_START_ADDR   (6U * PAGE_SIZE)   // 0x600
+#define FLASH_DUMP_CHUNK      64U
+#define FLASH_DUMP_START_ADDR   0x000000UL
+#define FLASH_DUMP_TEST_SIZE    0x001000UL   // 4 KB test
+#define FLASH_DUMP_FULL_SIZE    0x200000UL   // 2 MB flash
+#define FLASH_DUMP_CHUNK_SIZE   256U
+#define FLASH_DUMP_CHUNK_SIZE 256U
+
+
+volatile uint32_t g_dump_total_size = 0;
+volatile uint32_t g_dump_chunks_sent = 0;
+volatile uint32_t g_dump_bytes_sent = 0;
+static uint32_t preflight_flash_addr = 0x000000UL;
+static uint8_t pre_flight_buf[PRE_FLIGHT_BUF_SIZE] = {0};
+static uint16_t pre_flight_write_pkt = 0;
+static uint16_t pre_flight_pkt_count = 0;
+static uint8_t pre_flight_wrapped = 0;
+static uint16_t pre_flight_flush_read_pkt = 0;
+static uint16_t pre_flight_flush_remaining = 0;
+static uint8_t pre_flight_flush_active = 0;
+
+static uint8_t  preflight_page_buf[PAGE_SIZE];
+
+static uint8_t  preflight_page_write_active = 0;
+
+static uint16_t preflight_flush_pkt_index = 0;
+static uint16_t preflight_flush_remaining_pkts = 0;
 
 #define PIN_LOW(port, pin)   HAL_GPIO_WritePin((port), (pin), GPIO_PIN_RESET)
 #define PIN_HIGH(port, pin)  HAL_GPIO_WritePin((port), (pin), GPIO_PIN_SET)
@@ -44,8 +72,7 @@ extern UART_HandleTypeDef huart2;
 #define FLASH_WP_DISABLE_PROTECT()	HAL_GPIO_WritePin(FLASH_WP_GPIO_Port, FLASH_WP_Pin, GPIO_PIN_SET)
 
 void flash_write_enable(void);
-static int nmea_dm_to_deg_min_u8_u16(const char *dm, int is_lon,
-                                     uint8_t *deg_out, uint16_t *min_x1000_out);
+
 static int32_t barom_platform_gettick(void);
 
 
@@ -86,7 +113,9 @@ static uint8_t g_overflow = 0;
 //for testing
 static uint8_t 	rx_buf[256] = {0};
 static uint8_t 	flashBuf[256] = {0};
-static uint8_t	g_flashPageIndex = 0;
+
+static uint8_t g_flash_dump_buf[FLASH_DUMP_CHUNK_SIZE];
+
 
 /*------------------ Barometer functions -----------------*/
 
@@ -161,7 +190,7 @@ int barom_init(void)
   if (LPS22HH_Init(&baro) != LPS22HH_OK) return -2;
 
   // Pick an ODR (Hz). 25 Hz is a good start
-  if (LPS22HH_PRESS_SetOutputDataRate(&baro, 50.0f) != LPS22HH_OK) return -3;	//Pressure and Temp share the same ODR
+  if (LPS22HH_PRESS_SetOutputDataRate(&baro, 100.0f) != LPS22HH_OK) return -3;	//Pressure and Temp share the same ODR
 
   // This starts continuous conversions
   if (LPS22HH_PRESS_Enable(&baro) != LPS22HH_OK) return -4;
@@ -332,14 +361,14 @@ void flash_erase_entire_chip(void)
 {
     uint32_t addr;
 
+    flash_write_enable();
+    flash_wait_busy();
+
     for (addr = 0; addr < 0x200000; addr += 0x1000)
     {
         flash_sector_erase(addr);
         flash_wait_busy();
     }
-
-    // Reset flash write address
-    g_flashAddr = 0;
 }
 
 int flash_write_start(uint32_t addr, const uint8_t *data, uint16_t len)
@@ -410,12 +439,21 @@ void flash_write_enable(void)
     PIN_HIGH(SPI2_CS_Flash_GPIO_Port, SPI2_CS_Flash_Pin);
 }
 
-void flash_wait_busy(void)
+int flash_wait_busy(void)
 {
-    while (flash_read_status() & 0x01)   // BUSY bit
-    {
-        __NOP();
-    }
+	{
+	    uint32_t t0 = HAL_GetTick();
+
+	    while (flash_read_status() & 0x01)
+	    {
+	        if ((HAL_GetTick() - t0) >= 250)
+	        {
+	            return -1;
+	        }
+	    }
+
+	    return 0;
+	}
 }
 
 uint8_t flash_is_busy(void)
@@ -436,144 +474,35 @@ uint8_t flash_read_status(void)
     return rx[1];
 }
 
-
-/*------------------ GPS functions -----------------*/
-void gps_init(void)
+void flash_flush_partial_page(void)
 {
-	HAL_Delay(1000);  // let GPS boot
-
-	const char *cmd;
-
-	// full cold start (use when you want to force reacquire)
-	// cmd = "$PMTK104*37\r\n";
-	// HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 100);
-	// HAL_Delay(200);
-
-	// 1 Hz fix interval
-	cmd = "$PMTK220,1000*1F\r\n";
-	HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 100);
-	HAL_Delay(100);
-
-//	// Enable SBAS for better efficiency after able to get a fix
-//	cmd = "$PMTK313,1*2E\r\n";
-//	HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 100);
-//	HAL_Delay(100);
-
-	// Output only GGA (1); everything else disabled (0). If want RMC data change value 2
-	cmd = "$PMTK314,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*29\r\n";
-	HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 100);
-	HAL_Delay(100);
-
-	// query release (debug)
-//	cmd = "$PMTK605*31\r\n";
-//	HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 100);
-//	HAL_Delay(100);
-}
-
-
-//Chat GPT function
-static int nmea_dm_to_deg_min_u8_u16(const char *dm, int is_lon,
-                                     uint8_t *deg_out, uint16_t *min_x1000_out)
-{
-    if (!dm || dm[0] == '\0') return 0;
-
-    double v = atof(dm);                 // ddmm.mmmm / dddmm.mmmm
-    int deg = (int)(v / 100.0);
-    double minutes = v - (deg * 100.0);  // 0..60
-
-    if (minutes < 0.0 || minutes >= 60.0) return 0;
-
-    if (!is_lon) { if (deg < 0 || deg > 90)  return 0; }
-    else         { if (deg < 0 || deg > 180) return 0; }
-
-    long min_x1000 = lround(minutes * 1000.0); // 0..59999
-    if (min_x1000 < 0) min_x1000 = 0;
-    if (min_x1000 > 59999) min_x1000 = 59999;
-
-    *deg_out = (uint8_t)deg;
-    *min_x1000_out = (uint16_t)min_x1000;
-    return 1;
-}
-
-// Returns 1 if fix quality > 0 and fields exist; else 0
-
-//Chat GPT function
-int gps_gga(const char *gga,
-                      uint8_t *lat_deg, uint16_t *lat_min_x1000,
-                      uint8_t *lon_deg, uint16_t *lon_min_x1000)
-{
-    if (!(strncmp(gga, "$GNGGA,", 7) == 0 || strncmp(gga, "$GPGGA,", 7) == 0))
-        return 0;
-
-    char buf[160];
-    strncpy(buf, gga, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-
-    // fields: 2 lat, 3 N/S, 4 lon, 5 E/W, 6 fix quality
-    char *save = NULL;
-    char *tok = strtok_r(buf, ",", &save);
-    int field = 0;
-
-    const char *lat = NULL, *lon = NULL;
-    int fixq = 0;
-
-    while (tok)
+    if (g_fillBuf && g_fillBuf->index > 0)
     {
-        if (field == 2) lat = tok;
-        if (field == 4) lon = tok;
-        if (field == 6) fixq = atoi(tok);
+        memset(&g_fillBuf->data[g_fillBuf->index],
+               0xFF,
+               PAGE_SIZE - g_fillBuf->index);
 
-        tok = strtok_r(NULL, ",", &save);
-        field++;
+        g_fillBuf->seq = g_nextSeq++;
+        g_fillBuf->state = BUF_READY;
+        g_fillBuf = NULL;
+    }
+}
+
+uint8_t flash_has_pending_pages(void)
+{
+    if (g_writeInProgress)
+    {
+        return 1;
     }
 
-    if (fixq <= 0) return 0;                 // no fix -> ignore
-    if (!lat || !lon || lat[0]=='\0' || lon[0]=='\0') return 0;
-
-    if (!nmea_dm_to_deg_min_u8_u16(lat, 0, lat_deg, lat_min_x1000)) return 0;
-    if (!nmea_dm_to_deg_min_u8_u16(lon, 1, lon_deg, lon_min_x1000)) return 0;
-
-    return 1;
-}
-
-int gps_get_data(char *out, int maxlen, uint32_t timeout_ms)
-{
-    uint8_t c;
-    int idx = 0;
-    uint32_t t0 = HAL_GetTick();
-
-    if (maxlen <= 0) return 0;
-    memset(out, 0, maxlen);
-
-    while ((HAL_GetTick() - t0) < timeout_ms)
+    for (int i = 0; i < 4; i++)
     {
-        if (HAL_UART_Receive(&huart2, &c, 1, 10) == HAL_OK)
+        if (g_bufs[i].state == BUF_READY || g_bufs[i].state == BUF_WRITING)
         {
-            if (c == '$')
-            {
-                // hard resync: start a new sentence right here
-                idx = 0;
-                out[idx++] = '$';
-                continue;
-            }
-
-            // ignore everything until we've seen a '$'
-            if (idx == 0) continue;
-
-            if (idx < (maxlen - 1))
-                out[idx++] = (char)c;
-            else
-                idx = 0; // overflow -> resync
-
-            if (c == '\n')
-            {
-                out[idx] = '\0';
-                return 1;
-            }
+            return 1;
         }
     }
 
-    out[0] = '\0';
     return 0;
 }
 
@@ -622,7 +551,13 @@ void ring_buf_init(void)
 
     g_writeBuf = NULL;
     g_nextSeq = 0;
-    g_flashAddr = 0;
+
+    /*
+     * First 6 pages are reserved for preflight/original data.
+     * Start normal ring buffer logging on the 7th page.
+     */
+    g_flashAddr = FLASH_RING_START_ADDR;   // 0x600
+
     g_writeInProgress = 0;
     g_overflow = 0;
 }
@@ -632,8 +567,11 @@ static FlashBuf_t *find_empty_buf(void)
     for (int i = 0; i < 4; i++)
     {
         if (g_bufs[i].state == BUF_EMPTY)
+        {
             return &g_bufs[i];
+        }
     }
+
     return NULL;
 }
 
@@ -646,7 +584,9 @@ static FlashBuf_t *find_oldest_ready_buf(void)
         if (g_bufs[i].state == BUF_READY)
         {
             if (!best || g_bufs[i].seq < best->seq)
+            {
                 best = &g_bufs[i];
+            }
         }
     }
 
@@ -657,27 +597,33 @@ static FlashBuf_t *find_oldest_ready_buf(void)
 uint8_t write_ring_buf(const uint8_t *packet, uint16_t len)
 {
     if (!packet || len != PKT_LEN || !g_fillBuf)
+    {
         return 0;
+    }
 
+    /*
+     * With PKT_LEN = 32 and PAGE_DATA_LEN = 256,
+     * exactly 8 packets fit per flash page.
+     */
     if ((g_fillBuf->index + len) > PAGE_DATA_LEN)
+    {
         return 0;
+    }
 
     memcpy(&g_fillBuf->data[g_fillBuf->index], packet, len);
     g_fillBuf->index += len;
 
     if (g_fillBuf->index == PAGE_DATA_LEN)
     {
-        // Footer
-        g_fillBuf->data[PAGE_SEQ_LSB] = g_nextSeq & 0xFF;
-        g_fillBuf->data[PAGE_SEQ_MSB] = (g_nextSeq >> 8);
-        g_fillBuf->data[PAGE_CRC_LSB] = 0xFF;
-        g_fillBuf->data[PAGE_CRC_MSB] = 0xFF;
+        /*
+         * No footer anymore.
+         * The entire 256-byte page is packet data.
+         */
 
         g_fillBuf->seq = g_nextSeq++;
         g_fillBuf->state = BUF_READY;
 
-        FlashBuf_t *next;
-		next = find_empty_buf();
+        FlashBuf_t *next = find_empty_buf();
 
         if (!next)
         {
@@ -688,6 +634,7 @@ uint8_t write_ring_buf(const uint8_t *packet, uint16_t len)
 
         memset(next->data, 0xFF, PAGE_SIZE);
         next->index = 0;
+        next->seq = 0;
         next->state = BUF_FILLING;
 
         g_fillBuf = next;
@@ -700,28 +647,53 @@ void service_ring(void)
 {
     FlashBuf_t *buf;
 
-    // If a write is ongoing
+    /*
+     * If a write is ongoing, check if flash is still busy.
+     */
     if (g_writeInProgress)
     {
         if (flash_is_busy())
+        {
             return;
+        }
 
-        // Write finished
+//        /*
+//         * Optional readback test.
+//         * Since g_flashAddr now starts at FLASH_RING_START_ADDR,
+//         * check against that instead of PAGE_SIZE.
+//         */
+//        if (g_flashAddr > FLASH_RING_START_ADDR)
+//        {
+//            flash_read(g_flashAddr - PAGE_SIZE, flashReadBack, PAGE_SIZE);
+//            // compare flashReadBack[] to g_writeBuf->data[]
+//            __NOP();   // inspect flashReadBack here
+//        }
+
+        /*
+         * Write finished. Reuse this RAM buffer.
+         */
         memset(g_writeBuf->data, 0xFF, PAGE_SIZE);
         g_writeBuf->index = 0;
+        g_writeBuf->seq = 0;
         g_writeBuf->state = BUF_EMPTY;
 
         g_writeBuf = NULL;
         g_writeInProgress = 0;
 
-        // Recover if stalled
+        /*
+         * Recover if the fill buffer stalled because all buffers were full.
+         */
         if (!g_fillBuf)
         {
             buf = find_empty_buf();
+
             if (buf)
             {
-                buf->state = BUF_FILLING;
+                memset(buf->data, 0xFF, PAGE_SIZE);
                 buf->index = 0;
+                buf->seq = 0;
+                buf->state = BUF_FILLING;
+
                 g_fillBuf = buf;
                 g_overflow = 0;
             }
@@ -730,13 +702,27 @@ void service_ring(void)
         return;
     }
 
-    // Start new write if possible
+    /*
+     * Start a new flash write if a full page is ready.
+     */
     buf = find_oldest_ready_buf();
-    if (!buf) return;
 
-    if ((g_flashAddr + PAGE_SIZE) > FLASH_TOTAL_SIZE)
+    if (!buf)
+    {
         return;
+    }
 
+    /*
+     * Do not write past flash memory.
+     */
+    if ((g_flashAddr + PAGE_SIZE) > FLASH_TOTAL_SIZE)
+    {
+        return;
+    }
+
+    /*
+     * Start writing exactly one 256-byte page.
+     */
     if (flash_write_start(g_flashAddr, buf->data, PAGE_SIZE) == 0)
     {
         buf->state = BUF_WRITING;
@@ -751,6 +737,73 @@ void service_ring(void)
 uint8_t flash_ring_overflowed(void)
 {
     return g_overflow;
+}
+
+void preflight_buf_reset(void)
+{
+    memset(pre_flight_buf, 0xFF, PRE_FLIGHT_BUF_SIZE);
+
+    pre_flight_write_pkt = 0;
+    pre_flight_pkt_count = 0;
+    pre_flight_wrapped = 0;
+}
+
+void preflight_buf_append(const uint8_t *tx_buf)
+{
+    if (tx_buf == NULL)
+    {
+        return;
+    }
+
+    uint16_t byte_index = pre_flight_write_pkt * PKT_LEN;
+
+    memcpy(&pre_flight_buf[byte_index], tx_buf, PKT_LEN);
+
+    pre_flight_write_pkt++;
+
+    if (pre_flight_write_pkt >= PRE_FLIGHT_MAX_PKTS)
+    {
+        pre_flight_write_pkt = 0;
+        pre_flight_wrapped = 1;
+    }
+
+    if (pre_flight_pkt_count < PRE_FLIGHT_MAX_PKTS)
+    {
+        pre_flight_pkt_count++;
+    }
+}
+
+void preflight_buf_flush_to_flash(uint32_t *flash_addr)
+{
+    if (flash_addr == NULL)
+    {
+        return;
+    }
+
+    uint16_t start_pkt;
+
+    if (pre_flight_pkt_count < PRE_FLIGHT_MAX_PKTS)
+    {
+        // Buffer never wrapped, oldest packet is at slot 0
+        start_pkt = 0;
+    }
+    else
+    {
+        // Buffer wrapped, oldest packet is where the next write would happen
+        start_pkt = pre_flight_write_pkt;
+    }
+
+    for (uint16_t i = 0; i < pre_flight_pkt_count; i++)
+    {
+        uint16_t pkt_index = (start_pkt + i) % PRE_FLIGHT_MAX_PKTS;
+        uint16_t byte_index = pkt_index * PKT_LEN;
+
+        flash_wait_busy();
+        flash_page_program(*flash_addr, &pre_flight_buf[byte_index], PKT_LEN);
+        flash_wait_busy();
+
+        *flash_addr += PKT_LEN;
+    }
 }
 
 /*------------------ Old Functions -----------------*/
@@ -782,45 +835,210 @@ int flash_page_program(uint32_t addr, const uint8_t *data, uint16_t len)
     return 0;
 }
 
-uint8_t flash_append_packet(const uint8_t *packet, uint16_t len)
+uint8_t preflight_flush_service(uint8_t max_pages)
 {
-    if (packet == NULL) return 0;
-    if (len != PKT_LEN) return 0;
+    uint8_t pages_started = 0;
 
-     //Only allow packet data in bytes 0..251
-    if ((g_flashPageIndex + len) > PAGE_DATA_LEN)
+    if (!pre_flight_flush_active)
     {
         return 0;
     }
 
-    memcpy(&flashBuf[g_flashPageIndex], packet, len);
-    g_flashPageIndex += len;
-
-    // When payload area is full, add footer and write whole page
-    if (g_flashPageIndex == PAGE_DATA_LEN)
+    /*
+     * If a preflight page write was already started, wait for it to finish.
+     * Do NOT block. Just return and try again next loop.
+     */
+    if (preflight_page_write_active)
     {
-        // Store page sequence in footer
-        flashBuf[PAGE_SEQ_LSB] = (uint8_t)(g_nextSeq & 0xFF);
-        flashBuf[PAGE_SEQ_MSB] = (uint8_t)((g_nextSeq >> 8) & 0xFF);
+        if (flash_is_busy())
+        {
+            return 0;
+        }
 
-        // Leave last 2 bytes unused for now
-        flashBuf[PAGE_CRC_LSB] = 0xFF;
-        flashBuf[PAGE_CRC_MSB] = 0xFF;
-
-        flash_page_program(g_flashAddr, flashBuf, PAGE_SIZE);
-
-        g_flashAddr += PAGE_SIZE;
-        g_flashPageIndex = 0;
-        g_nextSeq++;
-
-
-		//Read full Page Packet
-//		flash_read(0x000000, rx_buf, 256);
-//
-//		__NOP();
-
-		memset(flashBuf, 0xFF, PAGE_SIZE);   // optional but helpful
+        preflight_page_write_active = 0;
     }
 
-    return 1;
+    while ((pages_started < max_pages) && (preflight_flush_remaining_pkts > 0))
+    {
+        /*
+         * Do not overlap the normal ring area.
+         */
+        if ((preflight_flash_addr + PAGE_SIZE) > FLASH_RING_START_ADDR)
+        {
+            pre_flight_flush_active = 0;
+            return pages_started;
+        }
+
+        /*
+         * If the flash is busy because the normal ring started a write,
+         * do not block.
+         */
+        if (flash_is_busy())
+        {
+            return pages_started;
+        }
+
+        /*
+         * Build one 256-byte page from up to 8 preflight packets.
+         */
+        memset(preflight_page_buf, 0xFF, PAGE_SIZE);
+
+        uint16_t packets_this_page = preflight_flush_remaining_pkts;
+
+        if (packets_this_page > PKTS_PER_PAGE)
+        {
+            packets_this_page = PKTS_PER_PAGE;
+        }
+
+        for (uint16_t i = 0; i < packets_this_page; i++)
+        {
+            uint8_t *src = &pre_flight_buf[preflight_flush_pkt_index * PKT_LEN];
+            uint8_t *dst = &preflight_page_buf[i * PKT_LEN];
+
+            memcpy(dst, src, PKT_LEN);
+
+            preflight_flush_pkt_index++;
+
+            if (preflight_flush_pkt_index >= PRE_FLIGHT_MAX_PKTS)
+            {
+                preflight_flush_pkt_index = 0;
+            }
+
+            preflight_flush_remaining_pkts--;
+        }
+
+        /*
+         * Start one non-blocking page program.
+         * flash_write_start() should only launch the program command.
+         * It should not wait for completion.
+         */
+        if (flash_write_start(preflight_flash_addr, preflight_page_buf, PAGE_SIZE) != 0)
+        {
+            return pages_started;
+        }
+
+        preflight_flash_addr += PAGE_SIZE;
+        preflight_page_write_active = 1;
+        pages_started++;
+
+        /*
+         * Important: return after starting one page write.
+         * Let future calls wait for busy to clear.
+         */
+        return pages_started;
+    }
+
+    if (preflight_flush_remaining_pkts == 0 && !preflight_page_write_active)
+    {
+        pre_flight_flush_active = 0;
+    }
+
+    return pages_started;
+}
+
+uint8_t preflight_flush_done(void)
+{
+    return ((pre_flight_flush_active == 0U) &&
+            (preflight_page_write_active == 0U));
+}
+
+void preflight_flush_start(void)
+{
+    if (pre_flight_wrapped)
+    {
+        preflight_flush_pkt_index = pre_flight_write_pkt;
+    }
+    else
+    {
+        preflight_flush_pkt_index = 0;
+    }
+
+    preflight_flush_remaining_pkts = pre_flight_pkt_count;
+    pre_flight_flush_active = (preflight_flush_remaining_pkts > 0) ? 1U : 0U;
+
+    preflight_flash_addr = 0x000000UL;
+
+    preflight_page_write_active = 0;
+}
+
+void dump_flash_over_usb(uint32_t start_addr, uint32_t total_size)
+{
+    uint32_t addr = start_addr;
+    uint32_t remaining = total_size;
+
+    const char begin_msg[] = "\r\nROCKET_FLASH_DUMP_BEGIN\r\n";
+    const char end_msg[]   = "\r\nROCKET_FLASH_DUMP_END\r\n";
+
+    g_dump_total_size = total_size;
+    g_dump_chunks_sent = 0;
+    g_dump_bytes_sent = 0;
+
+    usb_cdc_write_all((const uint8_t *)begin_msg, sizeof(begin_msg) - 1U);
+
+    while (remaining > 0U)
+    {
+        uint32_t chunk = remaining;
+
+        if (chunk > FLASH_DUMP_CHUNK_SIZE)
+        {
+            chunk = FLASH_DUMP_CHUNK_SIZE;
+        }
+
+        flash_read(addr, g_flash_dump_buf, chunk);
+
+        if (usb_cdc_write_all(g_flash_dump_buf, chunk) != UX_SUCCESS)
+        {
+            const char err_msg[] = "\r\nROCKET_FLASH_DUMP_ABORTED\r\n";
+            usb_cdc_write_all((const uint8_t *)err_msg, sizeof(err_msg) - 1U);
+            return;
+        }
+
+        addr += chunk;
+        remaining -= chunk;
+
+        g_dump_chunks_sent++;
+        g_dump_bytes_sent += chunk;
+    }
+
+    usb_cdc_write_all((const uint8_t *)end_msg, sizeof(end_msg) - 1U);
+}
+
+void usb_init(void)
+{
+	  MX_USBX_Device_Standalone_Init();
+	  MX_USB_PCD_Init();
+	  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS, 0x00, PCD_SNG_BUF, 0x40);
+	  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS, 0x80, PCD_SNG_BUF, 0x80);
+	  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS, 0x03, PCD_SNG_BUF, 0x140);
+	  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS, 0x83, PCD_SNG_BUF, 0x180);
+	  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS, 0x82, PCD_SNG_BUF, 0x1C0);
+	  _ux_dcd_stm32_initialize((ULONG)USB_DRD_FS,
+	                           (ULONG)&hpcd_USB_DRD_FS);
+	  HAL_NVIC_ClearPendingIRQ(USB_DRD_FS_IRQn);
+	  HAL_NVIC_EnableIRQ(USB_DRD_FS_IRQn);
+	  HAL_PCD_Start(&hpcd_USB_DRD_FS);
+}
+
+void usb_dump(uint32_t timeout)
+{
+	  uint8_t dump_done = 0;
+	  uint32_t usb_start_time = HAL_GetTick();
+
+
+	  while (timeout > 0)
+	  {
+		  timeout--;
+	      _ux_system_tasks_run();
+
+	      if ((dump_done == 0U) &&
+	          ((HAL_GetTick() - usb_start_time) > 8000U))
+	      {
+	          dump_done = 1U;
+
+	          // First test: only 256 bytes
+	          dump_flash_over_usb(0x00000UL, 0x200000UL);
+	      }
+
+	      HAL_Delay(10);
+	  }
 }
